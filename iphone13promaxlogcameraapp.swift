@@ -1398,8 +1398,8 @@ final class AppleLogCameraEngine: NSObject, ObservableObject, @unchecked Sendabl
     private(set) var postGradePipelineState: MTLComputePipelineState?
     private var textureCache: CVMetalTextureCache?
     private var ciContext: CIContext?
-    private var dummy3DLUTTexture: MTLTexture?
-    private var custom3DLUTTexture: MTLTexture?
+    private(set) var dummy3DLUTTexture: MTLTexture?
+    private(set) var custom3DLUTTexture: MTLTexture?
     private var custom3DLUTSize: Int = 33
     private var customLUTDomainMin = SIMD3<Float>(0.0, 0.0, 0.0)
     private var customLUTDomainMax = SIMD3<Float>(1.0, 1.0, 1.0)
@@ -3080,18 +3080,13 @@ final class PostProductionLogGrader: ObservableObject {
               let cmdBuf = queue.makeCommandBuffer(),
               let enc = cmdBuf.makeComputeCommandEncoder() else { return }
 
-        let dummyDesc = MTLTextureDescriptor()
-        dummyDesc.textureType = .type3D
-        dummyDesc.pixelFormat = .rgba16Float
-        dummyDesc.width = 2; dummyDesc.height = 2; dummyDesc.depth = 2
-        dummyDesc.usage = [.shaderRead]
-        guard let fallbackLUT = device.makeTexture(descriptor: dummyDesc) else { return }
+        guard let activeLUT = engine.custom3DLUTTexture ?? engine.dummy3DLUTTexture else { return }
 
         var uniforms = engine.makeShaderUniforms(writeRecord: false)
         enc.setComputePipelineState(postPipeline)
         enc.setTexture(inTex, index: 0)
         enc.setTexture(outTex, index: 1)
-        enc.setTexture(engine.custom3DLUTTexture ?? fallbackLUT, index: 2)
+        enc.setTexture(activeLUT, index: 2)
         enc.setBytes(&uniforms, length: MemoryLayout<AppleLogCameraEngine.PipelineUniforms>.stride, index: 0)
 
         let tgSize = MTLSize(width: 16, height: 16, depth: 1)
