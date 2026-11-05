@@ -1,16 +1,17 @@
 //
 //  iPhone13ProMaxLogCameraApp.swift
-//  CineLog13Pro v3.0 (Blackmagic Cinema Rig Edition)
-//  10-Bit Apple Log, 4:3 Open Gate, Focus Peaking, Rack Focus, Multi-Stage Stabilization & Live/Post Grading
+//  CineLog13Pro v4.0 (Physical Film Lab + Tetrahedral 3D LUT + Photo/Video Cinema Edition)
+//  10-Bit Apple Log, 4:3 Open Gate, Physics/Chemistry Film Emulsion Simulation, Still Photo Capture & Multi-Stage Stabilization
 //
 //  Target: iOS 16.0+ (Optimized for iPhone 13 Pro Max A15 Bionic & compatible with iPhone 15 Pro+)
-//  Frameworks: UIKit, SwiftUI, AVFoundation, AVKit, Metal, MetalKit, CoreVideo, CoreMedia, VideoToolbox, Photos, PhotosUI, CoreMotion, UniformTypeIdentifiers
+//  Frameworks: UIKit, SwiftUI, AVFoundation, AVKit, CoreImage, Metal, MetalKit, CoreVideo, CoreMedia, VideoToolbox, Photos, PhotosUI, CoreMotion, UniformTypeIdentifiers
 //
 
 import UIKit
 import SwiftUI
 import AVFoundation
 import AVKit
+import CoreImage
 import Metal
 import MetalKit
 import CoreVideo
@@ -23,7 +24,11 @@ import QuartzCore
 import UniformTypeIdentifiers
 import Combine
 
-// MARK: - 1. Embedded Metal Compute & Render Shaders (Orientation + Open Gate + Apple Log + Focus Peaking + Color Grading)
+// MARK: - 1. Embedded Metal Compute & Render Shaders
+// Includes:
+// - Bilateral Spatial De-Banding (eliminates ceiling/sky concentric rings in Open Gate & HLG)
+// - Tetrahedral 3D LUT Interpolation (eliminates 3D LUT voxel stepping / posterization on iPhone 15 LUTs)
+// - 5-Stage Physics, Optics & Darkroom Chemistry Film Simulation (Non-LUT, Non-Filter)
 
 enum MetalShaderLibrarySource {
     static let source = """
@@ -37,8 +42,10 @@ enum MetalShaderLibrarySource {
         int rotationMode;           // 0 = Portrait (90 CW), 1 = Landscape Right (0 deg), 2 = Landscape Left (180 deg), 3 = Portrait UpsideDown (270 CW)
         int mirrorHorizontal;       // 1 = Mirror X, 0 = Normal
 
-        int lookPreset;             // 0 = Raw Log, 1 = Official Rec.709, 2 = Kodak 2383, 3 = Fuji Eterna, 4 = Teal & Orange, 5 = Bleach Bypass, 6 = Custom 3D LUT
-        int bakeGradeIntoRecording; // 1 = Bake grade into recorded file, 0 = Record pure Apple Log & only grade viewfinder
+        int lookPreset;             // 0 = Raw Log, 1 = Official Rec.709, 2 = Custom .cube 3D LUT, 3 = Physical Film Emulsion Lab
+        int lutInputSpace;          // 0 = LUT expects Apple Log [0,1], 1 = LUT expects Rec.709 [0,1]
+        int customLUTSize;          // Dimension N of loaded 3D .cube LUT (e.g. 17, 33, 64, 65)
+        int bakeGradeIntoRecording; // 1 = Bake grade/film into recorded video, 0 = Record pure Apple Log & only preview grade
         int monitorDiagnosticMode;  // 0 = Normal, 1 = False Color IRE, 2 = Zebra (>94% IRE)
         int hasCustom3DLUT;         // 1 = Custom .cube 3D texture bound at texture(4)
 
@@ -46,6 +53,7 @@ enum MetalShaderLibrarySource {
         int focusPeakingColorIndex; // 0 = Green, 1 = Red, 2 = Yellow, 3 = Cyan
         float focusPeakingThreshold;// Edge magnitude threshold (0.04 to 0.25)
 
+        // Primary & 3-Way Color Grading Controls
         float exposureEV;           // -3.0 to +3.0 EV
         float contrast;             // 0.5 to 1.8 (1.0 = neutral)
         float pivot;                // Contrast pivot in Log space (default 0.488 = 18% gray)
@@ -56,15 +64,35 @@ enum MetalShaderLibrarySource {
         float temperatureOffset;    // -1.0 (Cool) to +1.0 (Warm)
         float tintOffset;           // -1.0 (Green) to +1.0 (Magenta)
         float lutIntensity;         // 0.0 to 1.0 blend for Look / 3D LUT
-        float filmGrain;            // 0.0 to 1.0 organic 35mm grain
-        float frameTime;            // Time seed for grain & zebra animation
+
+        // Physical Optics, Emulsion & Darkroom Chemistry Parameters
+        int filmStockID;            // 0 = Vision3 500T, 1 = Portra 400, 2 = Fuji Pro 400H, 3 = Velvia 50, 4 = Kodachrome 64, 5 = Ilford HP5 400 B&W
+        float pushPullStops;        // Darkroom chemical development time offset (-1.5 Pull to +2.0 Push stops)
+        float halationIntensity;    // Red-layer film base backscatter glow (0.0 to 1.0)
+        float halationRadius;       // Spatial scatter radius in pixels (1.0 to 12.0)
+        float emulsionBloom;        // Silver halide intra-layer Mie optical diffusion (0.0 to 1.0)
+        float lensVignette;         // Physical cos^4(theta) optical illumination falloff in linear light (0.0 to 1.0)
+        float chromaticAberration;  // Radial wavelength dispersion R/B magnification shift (0.0 to 1.0)
+        float printPaperContrast;   // Darkroom enlarger paper grade (0.6 = Grade 1 soft to 1.6 = Grade 4 hard)
+        float printWarmthSplit;     // Darkroom dichroic head split-toning (-1.0 Cool Selenium to +1.0 Warm Sepia/Gold)
+        float filmGrain;            // Physical Poisson silver halide grain density (0.0 to 1.0)
+        float grainSize;            // 1.0 = 135 (35mm), 0.6 = 120 Medium Format, 1.6 = 16mm Cinema
+        float debandingStrength;    // Spatial bilateral gradient smoothing to eliminate 8-bit/HLG sky/ceiling banding (0.0 to 1.0)
+        float frameTime;            // Time seed for organic grain & zebra animation
 
         float4 liftRGB;             // Shadow RGB offset (-0.2 to +0.2)
         float4 gammaRGB;            // Midtone RGB power/offset (-0.3 to +0.3)
         float4 gainRGB;             // Highlight RGB multiplier (0.5 to 1.5, default 1.0)
     };
 
-    // --- 1. YCbCr to Normalized RGB Conversion ---
+    // --- 0. Hash & Blue-Noise Dither Generator (Eliminates Quantization Contouring) ---
+    inline float hash12(float2 p) {
+        float3 p3 = fract(float3(p.xyx) * 0.1031);
+        p3 += dot(p3, p3.yzx + 33.33);
+        return fract((p3.x + p3.y) * p3.z);
+    }
+
+    // --- 1. YCbCr to Normalized RGB Conversion with Bilateral De-Banding ---
     inline float3 decodeYCbCrToRGB(float yRaw, float2 cbcrRaw, int isFullRange, int isSDR) {
         float y, cb, cr;
         if (isFullRange == 1) {
@@ -92,6 +120,67 @@ enum MetalShaderLibrarySource {
         }
     }
 
+    // Bilateral Spatial Gradient De-Banding on Y & CbCr planes (Removes 8-bit/ISP Posterization Rings on Ceilings/Skies)
+    inline void sampleDeBandedYCbCr(
+        texture2d<float, access::read> lumaPlane,
+        texture2d<float, access::read> chromaPlane,
+        uint2 lumaCoord,
+        uint srcW,
+        uint srcH,
+        float debandStrength,
+        float2 ditherSeed,
+        thread float& outY,
+        thread float2& outCbCr
+    ) {
+        uint cw = chromaPlane.get_width();
+        uint ch = chromaPlane.get_height();
+        uint2 chromaCenter = uint2(lumaCoord.x * cw / srcW, lumaCoord.y * ch / srcH);
+
+        float centerY = lumaPlane.read(lumaCoord).r;
+        float2 centerC = chromaPlane.read(chromaCenter).rg;
+
+        if (debandStrength <= 0.01) {
+            outY = centerY;
+            outCbCr = centerC;
+            return;
+        }
+
+        // 4-Tap Cross Bilateral Filter with wide radius (6px & 14px) to bridge flat quantization steps while preserving sharp edges
+        const int2 offsets[8] = {
+            int2( 6,  0), int2(-6,  0), int2( 0,  6), int2( 0, -6),
+            int2(12, 12), int2(-12, 12), int2(12, -12), int2(-12, -12)
+        };
+
+        float sumY = centerY;
+        float2 sumC = centerC;
+        float weightSumY = 1.0;
+        float weightSumC = 1.0;
+        float thresholdY = 0.022 * debandStrength;
+        float thresholdC = 0.028 * debandStrength;
+
+        for (int i = 0; i < 8; ++i) {
+            int nx = clamp(int(lumaCoord.x) + offsets[i].x, 0, int(srcW) - 1);
+            int ny = clamp(int(lumaCoord.y) + offsets[i].y, 0, int(srcH) - 1);
+            float sampleY = lumaPlane.read(uint2(nx, ny)).r;
+            float diffY = abs(sampleY - centerY);
+            float wy = exp(-(diffY * diffY) / max(0.000001, thresholdY * thresholdY));
+            sumY += sampleY * wy;
+            weightSumY += wy;
+
+            uint2 nChroma = uint2(uint(nx) * cw / srcW, uint(ny) * ch / srcH);
+            float2 sampleC = chromaPlane.read(nChroma).rg;
+            float diffC = length(sampleC - centerC);
+            float wc = exp(-(diffC * diffC) / max(0.000001, thresholdC * thresholdC));
+            sumC += sampleC * wc;
+            weightSumC += wc;
+        }
+
+        // Add sub-10-bit Triangular PDF Blue-Noise Dither to break up any residual contour rings
+        float dither = (hash12(ditherSeed) - hash12(ditherSeed + 17.3)) * (0.0018 * debandStrength);
+        outY = clamp((sumY / weightSumY) + dither, 0.0, 1.0);
+        outCbCr = clamp((sumC / weightSumC) + float2(dither * 0.5), 0.0, 1.0);
+    }
+
     // --- 2. ITU-R BT.2100 HLG & SDR Inverse OETF to Scene-Linear BT.2020 ---
     inline float hlgInverseOETFChannel(float ePrime) {
         const float a = 0.17883277;
@@ -105,10 +194,20 @@ enum MetalShaderLibrarySource {
         }
     }
 
+    // Inverse SDR Tone-Map for 8-bit Open Gate fallback: smoothly reconstructs compressed highlights above 0.75
+    inline float3 inverseSDRToLinearP3(float3 sdrRGB) {
+        float3 v = clamp(sdrRGB, 0.0, 0.998);
+        float3 gammaLinear = pow(v, float3(2.2));
+        // Smooth highlight knee expansion for specular bulbs/ceilings in 8-bit SDR mode
+        float3 highlightKnee = max(float3(0.0), v - 0.72) / 0.28;
+        float3 expanded = gammaLinear * (1.0 + 1.85 * highlightKnee * highlightKnee);
+        return expanded * 0.85;
+    }
+
     inline float3 sensorToLinearBT2020(float3 encodedRGB, int isSDR, float evBias, float rollOff) {
         float3 sceneLinear;
         if (isSDR == 1) {
-            float3 linP3 = pow(max(encodedRGB, 0.0), float3(2.2));
+            float3 linP3 = inverseSDRToLinearP3(encodedRGB);
             sceneLinear.r = 0.753833 * linP3.r + 0.198597 * linP3.g + 0.047570 * linP3.b;
             sceneLinear.g = 0.045744 * linP3.r + 0.941777 * linP3.g + 0.012479 * linP3.b;
             sceneLinear.b = -0.001210 * linP3.r + 0.017602 * linP3.g + 0.983608 * linP3.b;
@@ -182,24 +281,239 @@ enum MetalShaderLibrarySource {
         ), 0.0);
     }
 
-    // --- 4. Real-Time & Post Color Grading Engine ---
+    // --- 4. Industry-Standard Tetrahedral 3D LUT Interpolation (Zero Banding / Voxel Stepping) ---
+    // Reads exact lattice nodes via integer .read() and performs 32-bit float tetrahedral interpolation.
+    inline float3 sample3DLUTTetrahedral(
+        texture3d<float, access::sample> lutTex,
+        float3 rgbIn,
+        int lutSize
+    ) {
+        int N = max(2, lutSize);
+        float3 scaled = clamp(rgbIn, 0.0, 1.0) * float(N - 1);
+        int3 i0 = min(int3(floor(scaled)), int3(N - 2));
+        int3 i1 = i0 + int3(1, 1, 1);
+        float3 f = scaled - float3(i0);
+
+        float r = f.x;
+        float g = f.y;
+        float b = f.z;
+
+        float3 c000 = lutTex.read(uint3(i0.x, i0.y, i0.z)).rgb;
+        float3 c111 = lutTex.read(uint3(i1.x, i1.y, i1.z)).rgb;
+
+        float3 c1, c2;
+        float w0, w1, w2, w3;
+
+        if (r >= g) {
+            if (g >= b) {
+                // r >= g >= b
+                c1 = lutTex.read(uint3(i1.x, i0.y, i0.z)).rgb;
+                c2 = lutTex.read(uint3(i1.x, i1.y, i0.z)).rgb;
+                w0 = 1.0 - r; w1 = r - g; w2 = g - b; w3 = b;
+            } else if (r >= b) {
+                // r >= b > g
+                c1 = lutTex.read(uint3(i1.x, i0.y, i0.z)).rgb;
+                c2 = lutTex.read(uint3(i1.x, i0.y, i1.z)).rgb;
+                w0 = 1.0 - r; w1 = r - b; w2 = b - g; w3 = g;
+            } else {
+                // b > r >= g
+                c1 = lutTex.read(uint3(i0.x, i0.y, i1.z)).rgb;
+                c2 = lutTex.read(uint3(i1.x, i0.y, i1.z)).rgb;
+                w0 = 1.0 - b; w1 = b - r; w2 = r - g; w3 = g;
+            }
+        } else {
+            if (b >= g) {
+                // b >= g > r
+                c1 = lutTex.read(uint3(i0.x, i0.y, i1.z)).rgb;
+                c2 = lutTex.read(uint3(i0.x, i1.y, i1.z)).rgb;
+                w0 = 1.0 - b; w1 = b - g; w2 = g - r; w3 = r;
+            } else if (b >= r) {
+                // g > b >= r
+                c1 = lutTex.read(uint3(i0.x, i1.y, i0.z)).rgb;
+                c2 = lutTex.read(uint3(i0.x, i1.y, i1.z)).rgb;
+                w0 = 1.0 - g; w1 = g - b; w2 = b - r; w3 = r;
+            } else {
+                // g > r > b
+                c1 = lutTex.read(uint3(i0.x, i1.y, i0.z)).rgb;
+                c2 = lutTex.read(uint3(i1.x, i1.y, i0.z)).rgb;
+                w0 = 1.0 - g; w1 = g - r; w2 = r - b; w3 = b;
+            }
+        }
+
+        return clamp(w0 * c000 + w1 * c1 + w2 * c2 + w3 * c111, 0.0, 1.0);
+    }
+
+    // --- 5. True Physics, Optics & Darkroom Chemistry Film Emulsion Simulation (Non-LUT, Non-Filter) ---
+    // Implements:
+    //   Stage A: Hurter-Driffield (H&D) Sensitometric Density Curve D(log10 H) per R/G/B Emulsion Layer
+    //   Stage B: Chemical DIR (Development Inhibitor Releasing) Inter-Layer Coupler Matrix
+    //   Stage C: Darkroom Push/Pull Chemical Development & Enlarger Print Paper Transmittance T = 10^(-D)
+    //   Stage D: Selwyn-Poisson Silver Halide Dye-Cloud Grain Clumping proportional to sqrt(D * (Dmax - D))
+    inline float3 simulatePhysicalFilmChemistry(
+        float3 linearScene709,
+        float3 halationScatterLinear,
+        constant ColorGradeUniforms& u,
+        uint2 pixelCoord,
+        uint2 frameSize
+    ) {
+        // 1. Optical Vignetting: Real lens cos^4(theta) illumination falloff in linear photon space
+        float2 normUV = (float2(pixelCoord) / float2(max(uint2(1, 1), frameSize))) * 2.0 - 1.0;
+        float rSq = dot(normUV, normUV) * 0.42;
+        float cosTheta = 1.0 / sqrt(1.0 + rSq);
+        float cos4Falloff = pow(cosTheta, 4.0 * u.lensVignette);
+
+        // 2. Add Physical Red-Layer Film Base Backscatter (Halation) & Intra-Emulsion Mie Bloom in Linear Space
+        // Red light penetrates top Blue/Green layers, reflects off the film base, and re-exposes the Red layer (with 26% Green spill)
+        float3 halationWeights = float3(1.0, 0.26, 0.04) * u.halationIntensity * 0.85;
+        float3 bloomWeights    = float3(0.35, 0.35, 0.35) * u.emulsionBloom * 0.45;
+        float3 photonExposure  = max(linearScene709 * cos4Falloff + halationScatterLinear * (halationWeights + bloomWeights), 0.00005);
+
+        // 3. Emulsion Spectral Sensitivity & Stock Parameters (Dmin, Dmax, Gamma, Asymmetry Eta, DIR Coupler Matrix)
+        float3 dMin = float3(0.08, 0.08, 0.09);
+        float3 dMax = float3(2.85, 2.80, 2.75);
+        float3 gammaSlope = float3(0.62, 0.64, 0.65);
+        float3 shoulderEta = float3(0.88, 0.90, 0.94);
+        float3 logE0 = float3(-0.74, -0.74, -0.74); // Anchored around 18% middle gray (log10(0.18) = -0.7447)
+
+        // Inter-Layer DIR Chemical Coupler Matrix (simulates dye-cloud inhibition between Cyan/Magenta/Yellow layers)
+        float3 dirRowR = float3( 1.06, -0.04, -0.02);
+        float3 dirRowG = float3(-0.03,  1.05, -0.02);
+        float3 dirRowB = float3(-0.02, -0.05,  1.07);
+
+        if (u.filmStockID == 0) {
+            // Kodak Vision3 500T (5219 / Cinestill 800T ECN-2): Wide latitude, tungsten-balanced cool shadows, warm golden highlights
+            dMin = float3(0.07, 0.08, 0.11);
+            dMax = float3(2.75, 2.72, 2.68);
+            gammaSlope = float3(0.58, 0.60, 0.63);
+            shoulderEta = float3(0.82, 0.86, 0.90);
+            dirRowR = float3( 1.08, -0.05, -0.03);
+            dirRowG = float3(-0.03,  1.04, -0.01);
+            dirRowB = float3(-0.04, -0.04,  1.08);
+        } else if (u.filmStockID == 1) {
+            // Kodak Portra 400 (C-41): Ultra-smooth highlight shoulder, warm golden skin tones, low-contrast toe
+            dMin = float3(0.08, 0.08, 0.08);
+            dMax = float3(2.80, 2.76, 2.70);
+            gammaSlope = float3(0.61, 0.60, 0.58);
+            shoulderEta = float3(0.76, 0.80, 0.85);
+            dirRowR = float3( 1.07, -0.04, -0.03);
+            dirRowG = float3(-0.02,  1.04, -0.02);
+            dirRowB = float3(-0.02, -0.06,  1.08);
+        } else if (u.filmStockID == 2) {
+            // Fujifilm Pro 400H (C-41 4th Cyan-Sensitive Layer): Pastel highlights, emerald/cyan foliage, cool shadow separation
+            dMin = float3(0.07, 0.09, 0.10);
+            dMax = float3(2.78, 2.84, 2.82);
+            gammaSlope = float3(0.59, 0.63, 0.62);
+            shoulderEta = float3(0.80, 0.84, 0.86);
+            dirRowR = float3( 1.03, -0.05,  0.02);
+            dirRowG = float3(-0.04,  1.08, -0.04);
+            dirRowB = float3(-0.01, -0.03,  1.04);
+        } else if (u.filmStockID == 3) {
+            // Fujifilm Velvia 50 (E-6 Reversal Slide Film): High Dmax (3.6), steep sensitometric gamma, vivid dye coupling
+            dMin = float3(0.05, 0.05, 0.05);
+            dMax = float3(3.45, 3.45, 3.40);
+            gammaSlope = float3(0.82, 0.84, 0.85);
+            shoulderEta = float3(1.05, 1.05, 1.08);
+            dirRowR = float3( 1.16, -0.10, -0.06);
+            dirRowG = float3(-0.07,  1.15, -0.08);
+            dirRowB = float3(-0.05, -0.09,  1.14);
+        } else if (u.filmStockID == 4) {
+            // Kodak Kodachrome 64 (K-14 Selective Re-Exposure Coupler Process): Rich amber, deep cobalt blue, crisp contrast
+            dMin = float3(0.06, 0.06, 0.07);
+            dMax = float3(3.25, 3.20, 3.10);
+            gammaSlope = float3(0.76, 0.74, 0.70);
+            shoulderEta = float3(0.95, 0.94, 0.92);
+            dirRowR = float3( 1.14, -0.08, -0.06);
+            dirRowG = float3(-0.05,  1.10, -0.05);
+            dirRowB = float3(-0.06, -0.04,  1.10);
+        }
+
+        // Apply Darkroom Push/Pull Chemical Development Time Modifier:
+        // Pushing (+stops) increases effective exposure speed AND steepens chemical gamma slope while slightly raising base fog Dmin
+        float pushExposureGain = exp2(u.pushPullStops * 0.85);
+        float pushGammaBoost   = 1.0 + u.pushPullStops * 0.14;
+        gammaSlope *= pushGammaBoost;
+        dMin += max(0.0, u.pushPullStops) * float3(0.015, 0.012, 0.018);
+
+        // Apply Inter-Layer DIR Chemical Coupler Matrix in Linear Exposure Space
+        float3 coupledLin;
+        coupledLin.r = max(0.00005, dot(photonExposure, dirRowR)) * pushExposureGain;
+        coupledLin.g = max(0.00005, dot(photonExposure, dirRowG)) * pushExposureGain;
+        coupledLin.b = max(0.00005, dot(photonExposure, dirRowB)) * pushExposureGain;
+
+        // If Ilford HP5 Plus 400 B&W Silver Gelatin Film (Stock ID == 5):
+        // Weight by Panchromatic Spectral Sensitivity (Blue/Green high, Red moderate; adjustable via temperatureOffset as Yellow/Red optical filter)
+        if (u.filmStockID == 5) {
+            float filterShift = clamp(u.temperatureOffset, -1.0, 1.0);
+            float3 panWeights = normalize(float3(0.28 + 0.18 * filterShift, 0.56, 0.16 - 0.12 * filterShift));
+            float panMono = max(0.00005, dot(coupledLin, panWeights));
+            coupledLin = float3(panMono);
+            gammaSlope = float3(0.66 * pushGammaBoost);
+            shoulderEta = float3(0.84);
+        }
+
+        // 4. Evaluate Physical Hurter-Driffield (H&D) Density D(log10 E)
+        float3 logE = log10(coupledLin);
+        float3 z = -(gammaSlope / shoulderEta) * (logE - logE0);
+        float3 density = dMin + (dMax - dMin) / pow(1.0 + exp(clamp(z, -12.0, 12.0)), shoulderEta);
+
+        // 5. Physical Silver Halide Grain Structure in Optical Density Space (Selwyn's Law: proportional to sqrt(D * (Dmax - D)))
+        if (u.filmGrain > 0.001) {
+            float grainScale = max(0.35, u.grainSize);
+            float2 gCoord = floor(float2(pixelCoord) / grainScale) + float2(floor(u.frameTime * 24.0) * 19.1, floor(u.frameTime * 24.0) * 31.7);
+            float nR = hash12(gCoord) + hash12(gCoord * 1.7 + 5.3) - 1.0;
+            float nG = hash12(gCoord + 11.7) + hash12(gCoord * 1.7 + 19.1) - 1.0;
+            float nB = hash12(gCoord + 23.4) + hash12(gCoord * 1.7 + 37.9) - 1.0;
+            float3 grainNoise = (u.filmStockID == 5) ? float3(nG) : float3(nR, nG, nB * 1.15);
+
+            // Push processing physically enlarges silver grain clumps
+            float pushGrainMult = 1.0 + max(0.0, u.pushPullStops) * 0.35;
+            float3 dyeCloudEnvelope = sqrt(clamp((density - dMin) * (dMax - density), 0.0, 2.0));
+            density = clamp(density + grainNoise * u.filmGrain * 0.11 * pushGrainMult * dyeCloudEnvelope, dMin, dMax);
+        }
+
+        // 6. Darkroom Enlarger Print Paper Simulation (Converts Negative Optical Density D to Positive Print Reflectance)
+        // Normalize optical density around middle-gray density and apply Print Paper Contrast Grade (00 to 5)
+        float3 dMid = dMin + (dMax - dMin) * 0.46;
+        float3 paperLogE = (density - dMid) * u.printPaperContrast * 2.15;
+
+        // Dichroic Color Head / Split-Grade Toning (Warm Sepia/Gold vs Cool Selenium/Cyan shadows)
+        float3 printPositive = 1.0 / (1.0 + exp(-paperLogE));
+        float printLuma = dot(printPositive, float3(0.2126, 0.7152, 0.0722));
+
+        if (abs(u.printWarmthSplit) > 0.001) {
+            float3 warmHighlight = float3(0.035, 0.018, -0.032) * u.printWarmthSplit * printLuma;
+            float3 coolShadow    = float3(-0.025, 0.005, 0.038) * (-u.printWarmthSplit) * (1.0 - printLuma);
+            printPositive = clamp(printPositive + warmHighlight + coolShadow, 0.0, 1.0);
+        }
+
+        // Paper Base Dmin Creamy White Point & Dmax Deep Silver Black
+        printPositive = clamp(printPositive * 0.985 + float3(0.010, 0.009, 0.007), 0.0, 1.0);
+        return printPositive;
+    }
+
+    // --- 6. Master Color Grading & Film Simulation Pipeline ---
     inline float3 applyColorGradingPipeline(
         float3 appleLogIn,
+        float3 halationScatterLinear,
         constant ColorGradeUniforms& u,
         texture3d<float, access::sample> customLUT,
-        uint2 pixelCoord
+        uint2 pixelCoord,
+        uint2 frameSize
     ) {
         float3 logColor = appleLogIn;
 
+        // (A) White Balance Offset (Temperature & Tint in Log Space)
         logColor.r += u.temperatureOffset * 0.06 + u.tintOffset * 0.03;
         logColor.g -= u.tintOffset * 0.05;
         logColor.b -= u.temperatureOffset * 0.06 - u.tintOffset * 0.03;
 
+        // (B) 3-Way Lift / Gamma / Gain in Log Space
         float3 lifted = logColor + u.liftRGB.xyz * (1.0 - logColor);
         float3 gained = lifted * u.gainRGB.xyz;
         float3 gammaPower = max(float3(0.2), 1.0 - u.gammaRGB.xyz * 0.65);
         logColor = pow(clamp(gained, 0.0, 1.0), gammaPower);
 
+        // (C) Shadow Lift & Contrast around 18% Middle Gray Pivot (0.488)
         if (abs(u.shadowLift) > 0.001) {
             float shadowWeight = clamp(1.0 - (logColor.g / 0.5), 0.0, 1.0);
             logColor += u.shadowLift * shadowWeight * shadowWeight * 0.25;
@@ -207,11 +521,13 @@ enum MetalShaderLibrarySource {
         logColor = (logColor - u.pivot) * u.contrast + u.pivot;
         logColor = clamp(logColor, 0.0, 1.0);
 
+        // Mode 0: Pure Apple Log Output
         if (u.lookPreset == 0) {
             float luma = dot(logColor, float3(0.2627, 0.6780, 0.0593));
             return clamp(mix(float3(luma), logColor, u.saturation), 0.0, 1.0);
         }
 
+        // Convert Graded Apple Log -> Linear BT.2020 -> Linear Rec.709
         float3 lin2020 = appleLogToLinear(logColor);
         float3 lin709;
         lin709.r =  1.6604910 * lin2020.r - 0.5876411 * lin2020.g - 0.0728499 * lin2020.b;
@@ -219,40 +535,25 @@ enum MetalShaderLibrarySource {
         lin709.b = -0.0181508 * lin2020.r - 0.1005789 * lin2020.g + 1.1187297 * lin2020.b;
         lin709 = max(lin709, 0.0);
 
+        // Base Official Rec.709 Tone Mapping
         float3 x = lin709 * 1.38;
         float3 rec709 = clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0);
         rec709 = pow(rec709, float3(1.0 / 2.2));
 
         float3 styled = rec709;
-        float luma709 = dot(rec709, float3(0.2126, 0.7152, 0.0722));
 
-        if (u.lookPreset == 2) {
-            float3 sCurve = smoothstep(0.02, 0.98, rec709);
-            float3 shadowTint = float3(-0.03, 0.01, 0.045) * (1.0 - luma709);
-            float3 hiTint     = float3(0.04, 0.025, -0.03) * luma709;
-            styled = clamp(mix(rec709, sCurve, 0.45) + shadowTint + hiTint, 0.0, 1.0);
+        if (u.lookPreset == 2 && u.hasCustom3DLUT == 1) {
+            // Mode 2: Custom .cube 3D LUT with Tetrahedral Interpolation (Zero Banding!)
+            float3 lutSource = (u.lutInputSpace == 0) ? logColor : rec709;
+            styled = sample3DLUTTetrahedral(customLUT, lutSource, u.customLUTSize);
         } else if (u.lookPreset == 3) {
-            float3 soft = mix(rec709, sqrt(rec709), 0.18);
-            soft = soft * 0.90 + 0.04;
-            soft.r *= 0.97;
-            soft.g *= 1.02;
-            soft.b *= 1.03;
-            styled = clamp(soft, 0.0, 1.0);
-        } else if (u.lookPreset == 4) {
-            float3 shadows = float3(-0.06, 0.02, 0.08) * pow(1.0 - luma709, 1.4);
-            float3 midsHi  = float3(0.07, 0.02, -0.05) * pow(luma709, 0.9);
-            styled = clamp(smoothstep(0.0, 1.0, rec709) * 0.35 + rec709 * 0.65 + shadows + midsHi, 0.0, 1.0);
-        } else if (u.lookPreset == 5) {
-            float3 desat = mix(float3(luma709), rec709, 0.42);
-            float3 hard  = smoothstep(0.06, 0.94, desat);
-            styled = clamp(mix(desat, hard, 0.6), 0.0, 1.0);
-        } else if (u.lookPreset == 6 && u.hasCustom3DLUT == 1) {
-            constexpr sampler lutSampler(coord::normalized, address::clamp_to_edge, filter::linear);
-            styled = customLUT.sample(lutSampler, logColor).rgb;
+            // Mode 3: True Physics, Optics & Darkroom Chemistry Film Simulation
+            styled = simulatePhysicalFilmChemistry(lin709, halationScatterLinear, u, pixelCoord, frameSize);
         }
 
         float3 result = mix(rec709, styled, clamp(u.lutIntensity, 0.0, 1.0));
 
+        // Saturation & Skin-Tone Aware Vibrance
         float finalLuma = dot(result, float3(0.2126, 0.7152, 0.0722));
         float maxC = max(result.r, max(result.g, result.b));
         float minC = min(result.r, min(result.g, result.b));
@@ -261,17 +562,10 @@ enum MetalShaderLibrarySource {
         float totalSat = max(0.0, u.saturation * vibranceFactor);
         result = clamp(mix(float3(finalLuma), result, totalSat), 0.0, 1.0);
 
-        if (u.filmGrain > 0.001) {
-            float2 seed = float2(pixelCoord) * 0.137 + float2(u.frameTime * 11.3, u.frameTime * 7.9);
-            float noise = fract(sin(dot(seed, float2(12.9898, 78.233))) * 43758.5453) - 0.5;
-            float midMask = 4.0 * finalLuma * (1.0 - finalLuma);
-            result = clamp(result + noise * u.filmGrain * 0.09 * midMask, 0.0, 1.0);
-        }
-
         return result;
     }
 
-    // --- 5. False Color IRE Exposure Diagnostic Map ---
+    // --- 7. False Color IRE Exposure Diagnostic Map ---
     inline float3 falseColorMap(float lumaIRE) {
         if (lumaIRE < 0.05) return float3(0.55, 0.0, 0.85);
         else if (lumaIRE < 0.18) return float3(0.1, 0.35, 0.95);
@@ -283,7 +577,7 @@ enum MetalShaderLibrarySource {
         else return float3(0.98, 0.1, 0.1);
     }
 
-    // --- 6. Sobel Edge Detection for Focus Peaking ---
+    // --- 8. Sobel Edge Detection for Focus Peaking ---
     inline float computeSobelEdge(texture2d<float, access::read> lumaPlane, uint2 center, uint maxW, uint maxH) {
         uint x0 = (center.x > 0) ? (center.x - 1) : 0;
         uint x2 = (center.x + 1 < maxW) ? (center.x + 1) : (maxW - 1);
@@ -304,7 +598,55 @@ enum MetalShaderLibrarySource {
         return sqrt(gx * gx + gy * gy);
     }
 
-    // --- 7. Main Camera Compute Kernel ---
+    // --- 9. Physical Halation & Optical Chromatic Dispersion Sampler ---
+    inline float3 sampleHalationAndDispersion(
+        texture2d<float, access::read> lumaPlane,
+        texture2d<float, access::read> chromaPlane,
+        uint2 lumaCoord,
+        uint srcW,
+        uint srcH,
+        constant ColorGradeUniforms& u,
+        thread float& centerYShiftR,
+        thread float& centerYShiftB
+    ) {
+        // Radial Optical Chromatic Aberration (shifts R and B luma sampling radially from optical center)
+        if (u.chromaticAberration > 0.01 && u.lookPreset == 3) {
+            float2 center = float2(srcW, srcH) * 0.5;
+            float2 delta = float2(lumaCoord) - center;
+            float2 shift = delta * (0.0045 * u.chromaticAberration);
+            uint2 rCoord = uint2(clamp(float2(lumaCoord) + shift, float2(0.0), float2(srcW - 1, srcH - 1)));
+            uint2 bCoord = uint2(clamp(float2(lumaCoord) - shift, float2(0.0), float2(srcW - 1, srcH - 1)));
+            centerYShiftR = lumaPlane.read(rCoord).r;
+            centerYShiftB = lumaPlane.read(bCoord).r;
+        }
+
+        if (u.lookPreset != 3 || (u.halationIntensity <= 0.01 && u.emulsionBloom <= 0.01)) {
+            return float3(0.0);
+        }
+
+        // 8-Direction Multi-Ring Spatial Scattering Kernel for Film Base Halation & Silver Bloom
+        float rad = max(2.0, u.halationRadius * 2.5);
+        const float2 dirs[8] = {
+            float2( 1.0,  0.0), float2(-1.0,  0.0), float2( 0.0,  1.0), float2( 0.0, -1.0),
+            float2( 0.707,  0.707), float2(-0.707,  0.707), float2( 0.707, -0.707), float2(-0.707, -0.707)
+        };
+
+        float scatterAccum = 0.0;
+        for (int i = 0; i < 8; ++i) {
+            float2 pos1 = clamp(float2(lumaCoord) + dirs[i] * rad, float2(0.0), float2(srcW - 1, srcH - 1));
+            float2 pos2 = clamp(float2(lumaCoord) + dirs[i] * (rad * 2.2), float2(0.0), float2(srcW - 1, srcH - 1));
+            float y1 = lumaPlane.read(uint2(pos1)).r;
+            float y2 = lumaPlane.read(uint2(pos2)).r;
+            // Only high-energy photons above highlight threshold penetrate the emulsion to the film base
+            float hi1 = max(0.0, y1 - 0.68) * 3.125;
+            float hi2 = max(0.0, y2 - 0.68) * 3.125;
+            scatterAccum += (hi1 * hi1 * 0.65 + hi2 * hi2 * 0.35);
+        }
+        scatterAccum /= 8.0;
+        return float3(scatterAccum);
+    }
+
+    // --- 10. Main Camera Compute Kernel ---
     kernel void processAppleLogFrame(
         texture2d<float, access::read>   lumaPlane     [[texture(0)]],
         texture2d<float, access::read>   chromaPlane   [[texture(1)]],
@@ -343,15 +685,35 @@ enum MetalShaderLibrarySource {
         }
 
         uint2 lumaCoord = uint2(srcX, srcY);
-        uint2 chromaCoord = uint2(
-            srcX * chromaPlane.get_width() / srcW,
-            srcY * chromaPlane.get_height() / srcH
+
+        // Sample Y & CbCr with Bilateral Spatial De-Banding + Blue-Noise Dithering
+        float ySample = 0.0;
+        float2 cbcrSample = float2(0.5);
+        sampleDeBandedYCbCr(
+            lumaPlane,
+            chromaPlane,
+            lumaCoord,
+            srcW,
+            srcH,
+            uniforms.debandingStrength,
+            float2(gid) + uniforms.frameTime * 13.7,
+            ySample,
+            cbcrSample
         );
 
-        float  ySample    = lumaPlane.read(lumaCoord).r;
-        float2 cbcrSample = chromaPlane.read(chromaCoord).rg;
+        float yShiftR = ySample;
+        float yShiftB = ySample;
+        float3 halationLinear = sampleHalationAndDispersion(
+            lumaPlane, chromaPlane, lumaCoord, srcW, srcH, uniforms, yShiftR, yShiftB
+        );
 
         float3 sensorRGB = decodeYCbCrToRGB(ySample, cbcrSample, uniforms.isFullRangeYCbCr, uniforms.isSDRSensorInput);
+        if (uniforms.chromaticAberration > 0.01 && uniforms.lookPreset == 3) {
+            float3 rgbR = decodeYCbCrToRGB(yShiftR, cbcrSample, uniforms.isFullRangeYCbCr, uniforms.isSDRSensorInput);
+            float3 rgbB = decodeYCbCrToRGB(yShiftB, cbcrSample, uniforms.isFullRangeYCbCr, uniforms.isSDRSensorInput);
+            sensorRGB.r = rgbR.r;
+            sensorRGB.b = rgbB.b;
+        }
 
         float3 appleLogRGB;
         if (uniforms.isNativeAppleLog == 1) {
@@ -361,7 +723,14 @@ enum MetalShaderLibrarySource {
             appleLogRGB = linearToAppleLog(linearBT2020);
         }
 
-        float3 gradedRGB = applyColorGradingPipeline(appleLogRGB, uniforms, customLUTTex, gid);
+        float3 gradedRGB = applyColorGradingPipeline(
+            appleLogRGB,
+            halationLinear,
+            uniforms,
+            customLUTTex,
+            gid,
+            uint2(outW, outH)
+        );
 
         float3 recordSignal = (uniforms.bakeGradeIntoRecording == 1) ? gradedRGB : appleLogRGB;
         recordOutTex.write(float4(recordSignal, 1.0), gid);
@@ -378,14 +747,13 @@ enum MetalShaderLibrarySource {
             }
         }
 
-        // Focus Peaking Overlay (Viewfinder Only — never baked into recorded video)
         if (uniforms.focusPeakingEnabled == 1) {
             float edgeMag = computeSobelEdge(lumaPlane, lumaCoord, srcW, srcH);
             if (edgeMag >= uniforms.focusPeakingThreshold) {
-                float3 peakColor = float3(0.1, 1.0, 0.2); // Default Green
-                if (uniforms.focusPeakingColorIndex == 1) peakColor = float3(1.0, 0.12, 0.12); // Red
-                else if (uniforms.focusPeakingColorIndex == 2) peakColor = float3(1.0, 0.92, 0.1); // Yellow
-                else if (uniforms.focusPeakingColorIndex == 3) peakColor = float3(0.1, 0.95, 1.0); // Cyan
+                float3 peakColor = float3(0.1, 1.0, 0.2);
+                if (uniforms.focusPeakingColorIndex == 1) peakColor = float3(1.0, 0.12, 0.12);
+                else if (uniforms.focusPeakingColorIndex == 2) peakColor = float3(1.0, 0.92, 0.1);
+                else if (uniforms.focusPeakingColorIndex == 3) peakColor = float3(0.1, 0.95, 1.0);
                 monitorRGB = mix(monitorRGB, peakColor, 0.88);
             }
         }
@@ -393,7 +761,7 @@ enum MetalShaderLibrarySource {
         previewOutTex.write(float4(monitorRGB, 1.0), gid);
     }
 
-    // --- 8. Post-Production Video Frame Grading Kernel ---
+    // --- 11. Post-Production Video Frame Grading Kernel ---
     kernel void gradeExistingLogFrame(
         texture2d<float, access::read>   sourceTex    [[texture(0)]],
         texture2d<float, access::write>  gradedOutTex [[texture(1)]],
@@ -401,7 +769,9 @@ enum MetalShaderLibrarySource {
         constant ColorGradeUniforms&     uniforms     [[buffer(0)]],
         uint2 gid [[thread_position_in_grid]]
     ) {
-        if (gid.x >= gradedOutTex.get_width() || gid.y >= gradedOutTex.get_height()) {
+        uint outW = gradedOutTex.get_width();
+        uint outH = gradedOutTex.get_height();
+        if (gid.x >= outW || gid.y >= outH) {
             return;
         }
         float3 srcLog = sourceTex.read(gid).rgb;
@@ -413,11 +783,11 @@ enum MetalShaderLibrarySource {
             }
             srcLog = linearToAppleLog(lin);
         }
-        float3 graded = applyColorGradingPipeline(srcLog, uniforms, customLUTTex, gid);
+        float3 graded = applyColorGradingPipeline(srcLog, float3(0.0), uniforms, customLUTTex, gid, uint2(outW, outH));
         gradedOutTex.write(float4(graded, 1.0), gid);
     }
 
-    // --- 9. Render Pipeline Shaders for MTKView ---
+    // --- 12. Render Pipeline Shaders for MTKView ---
     struct VertexOut {
         float4 position [[position]];
         float2 texCoord;
@@ -459,7 +829,20 @@ enum MetalShaderLibrarySource {
     """
 }
 
-// MARK: - 2. Cinema Camera & Stabilization Data Models
+// MARK: - 2. Cinema Camera, Film Lab & Capture Data Models
+
+enum CaptureModeOption: Int, CaseIterable, Identifiable {
+    case video = 0
+    case photo = 1
+
+    var id: Int { rawValue }
+    var title: String {
+        switch self {
+        case .video: return "VIDEO 摄影机"
+        case .photo: return "PHOTO 胶片相机"
+        }
+    }
+}
 
 enum CaptureOrientationMode: Int, CaseIterable, Identifiable {
     case portrait           = 0
@@ -569,16 +952,16 @@ enum AutoFocusRangeOption: Int, CaseIterable, Identifiable {
 }
 
 enum SensorFormatPreset: String, CaseIterable, Identifiable {
-    case openGateMax = "Open Gate 4:3 (满传感器最大分辨率)"
-    case uhd4K16x9   = "4K UHD 16:9 (3840×2160 10-Bit)"
+    case uhd4K16x9   = "4K UHD 16:9 (3840×2160 原生10-Bit)"
+    case openGateMax = "Open Gate 4:3 (4032×3024 满传感器)"
     case fhd1080p    = "1080p FHD 16:9 (1920×1080 高帧率)"
 
     var id: String { rawValue }
 
     var shortTitle: String {
         switch self {
-        case .openGateMax: return "Open Gate 4:3"
-        case .uhd4K16x9:   return "4K 16:9"
+        case .uhd4K16x9:   return "4K 10-Bit"
+        case .openGateMax: return "OpenGate 4:3"
         case .fhd1080p:    return "1080p"
         }
     }
@@ -637,25 +1020,77 @@ enum FrameRateOption: Double, CaseIterable, Identifiable {
 }
 
 enum LookPresetOption: Int, CaseIterable, Identifiable {
-    case rawLog       = 0
-    case rec709       = 1
-    case kodak2383    = 2
-    case fujiEterna   = 3
-    case tealOrange   = 4
-    case bleachBypass = 5
-    case customCube   = 6
+    case rawLog      = 0
+    case rec709      = 1
+    case customCube  = 2
+    case physicalLab = 3
 
     var id: Int { rawValue }
 
     var title: String {
         switch self {
-        case .rawLog:       return "Raw Log"
-        case .rec709:       return "Rec.709"
-        case .kodak2383:    return "Kodak 2383"
-        case .fujiEterna:   return "Fuji Eterna"
-        case .tealOrange:   return "Teal & Orange"
-        case .bleachBypass: return "Bleach Bypass"
-        case .customCube:   return "Custom .cube"
+        case .rawLog:      return "Raw Apple Log"
+        case .rec709:      return "Official Rec.709"
+        case .customCube:  return "3D LUT (.cube)"
+        case .physicalLab: return "物理胶片暗房"
+        }
+    }
+}
+
+enum LUTInputSpaceOption: Int, CaseIterable, Identifiable {
+    case appleLog = 0
+    case rec709   = 1
+
+    var id: Int { rawValue }
+
+    var title: String {
+        switch self {
+        case .appleLog: return "Apple Log 输入"
+        case .rec709:   return "Rec.709 输入"
+        }
+    }
+}
+
+enum PhysicalFilmStockOption: Int, CaseIterable, Identifiable {
+    case vision3_500T = 0
+    case portra400    = 1
+    case fujiPro400H  = 2
+    case velvia50     = 3
+    case kodachrome64 = 4
+    case ilfordHP5    = 5
+
+    var id: Int { rawValue }
+
+    var title: String {
+        switch self {
+        case .vision3_500T: return "Kodak Vision3 500T (ECN-2 电影负片)"
+        case .portra400:    return "Kodak Portra 400 (C-41 人像负片)"
+        case .fujiPro400H:  return "Fujifilm Pro 400H (四层青感负片)"
+        case .velvia50:     return "Fujifilm Velvia 50 (E-6 风光反转片)"
+        case .kodachrome64: return "Kodak Kodachrome 64 (K-14 传奇外偶片)"
+        case .ilfordHP5:    return "Ilford HP5 Plus 400 (D-76 银盐黑白)"
+        }
+    }
+
+    var shortName: String {
+        switch self {
+        case .vision3_500T: return "Vision3 500T"
+        case .portra400:    return "Portra 400"
+        case .fujiPro400H:  return "Fuji 400H"
+        case .velvia50:     return "Velvia 50"
+        case .kodachrome64: return "Kodachrome 64"
+        case .ilfordHP5:    return "Ilford HP5 B&W"
+        }
+    }
+
+    var chemistryBadge: String {
+        switch self {
+        case .vision3_500T: return "ECN-2 冲洗 • 去石墨层红光晕 + 柯达 2383 印片"
+        case .portra400:    return "C-41 冲洗 • DIR 成色剂耦合 + 柔和高光滚降"
+        case .fujiPro400H:  return "C-41 冲洗 • 第四青敏乳剂层 + 富士 Crystal 相纸"
+        case .velvia50:     return "E-6 反转冲洗 • Dmax 3.45 超高密度 + 高反差"
+        case .kodachrome64: return "K-14 三道外偶显影 • 琥珀高光 + 钴蓝暗部"
+        case .ilfordHP5:    return "D-76 显影 • 全色感光银盐 + 可变反差相纸"
         }
     }
 }
@@ -686,21 +1121,37 @@ enum AspectGuideOption: String, CaseIterable, Identifiable {
 }
 
 struct ColorGradeParameters: Equatable {
-    var lookPreset: LookPresetOption = .rec709
+    var lookPreset: LookPresetOption = .physicalLab
+    var lutInputSpace: LUTInputSpaceOption = .appleLog
     var bakeGradeIntoRecording: Bool = false
     var lutIntensity: Float = 1.0
 
+    // Primary Controls
     var exposureEV: Float = 0.0
     var contrast: Float = 1.0
     var pivot: Float = 0.488
-    var highlightRollOff: Float = 0.35
+    var highlightRollOff: Float = 0.38
     var shadowLift: Float = 0.0
     var saturation: Float = 1.0
-    var vibrance: Float = 0.0
+    var vibrance: Float = 0.05
     var temperatureOffset: Float = 0.0
     var tintOffset: Float = 0.0
-    var filmGrain: Float = 0.0
+    var debandingStrength: Float = 0.75
 
+    // Physical Film Lab Parameters (Optics, Emulsion & Darkroom Chemistry)
+    var filmStock: PhysicalFilmStockOption = .vision3_500T
+    var pushPullStops: Float = 0.0          // -1.5 to +2.0 stops chemical development time
+    var halationIntensity: Float = 0.42     // Film base red backscatter glow
+    var halationRadius: Float = 4.5         // Scatter radius
+    var emulsionBloom: Float = 0.25         // Silver halide optical diffusion
+    var lensVignette: Float = 0.30          // Natural cos^4(theta) lens falloff
+    var chromaticAberration: Float = 0.18   // Optical wavelength dispersion
+    var printPaperContrast: Float = 1.05    // Enlarger print paper contrast grade
+    var printWarmthSplit: Float = 0.12      // Dichroic head split-toning
+    var filmGrain: Float = 0.28             // Selwyn-Poisson silver grain density
+    var grainSize: Float = 1.0              // 1.0 = 35mm, 0.6 = 120 Medium Format, 1.6 = 16mm
+
+    // 3-Way Color Wheels
     var liftR: Float = 0.0
     var liftG: Float = 0.0
     var liftB: Float = 0.0
@@ -713,19 +1164,40 @@ struct ColorGradeParameters: Equatable {
     var gainG: Float = 1.0
     var gainB: Float = 1.0
 
+    mutating func applyStockDefaults(_ stock: PhysicalFilmStockOption) {
+        self.filmStock = stock
+        self.lookPreset = .physicalLab
+        switch stock {
+        case .vision3_500T:
+            halationIntensity = 0.52; emulsionBloom = 0.28; filmGrain = 0.30; printPaperContrast = 1.08; printWarmthSplit = 0.18
+        case .portra400:
+            halationIntensity = 0.22; emulsionBloom = 0.24; filmGrain = 0.20; printPaperContrast = 0.96; printWarmthSplit = 0.22
+        case .fujiPro400H:
+            halationIntensity = 0.18; emulsionBloom = 0.22; filmGrain = 0.18; printPaperContrast = 0.95; printWarmthSplit = -0.10
+        case .velvia50:
+            halationIntensity = 0.12; emulsionBloom = 0.15; filmGrain = 0.10; printPaperContrast = 1.22; printWarmthSplit = 0.05
+        case .kodachrome64:
+            halationIntensity = 0.20; emulsionBloom = 0.18; filmGrain = 0.22; printPaperContrast = 1.15; printWarmthSplit = 0.25
+        case .ilfordHP5:
+            halationIntensity = 0.35; emulsionBloom = 0.30; filmGrain = 0.42; printPaperContrast = 1.12; printWarmthSplit = 0.0
+        }
+    }
+
     mutating func reset() {
         let keepLook = lookPreset
         let keepBake = bakeGradeIntoRecording
+        let keepStock = filmStock
         self = ColorGradeParameters()
         self.lookPreset = keepLook
         self.bakeGradeIntoRecording = keepBake
+        self.applyStockDefaults(keepStock)
     }
 }
 
-// MARK: - 3. 3D .cube LUT Parser & Exporter (Scalar Float Math for Instant Swift Compilation)
+// MARK: - 3. 3D .cube LUT Parser & Exporter (Scalar Float Math + Tetrahedral Compatible)
 
 enum CubeLUTManager {
-    static func loadCubeLUT(from url: URL, device: MTLDevice) throws -> (MTLTexture, String) {
+    static func loadCubeLUT(from url: URL, device: MTLDevice) throws -> (MTLTexture, Int, String) {
         let accessed = url.startAccessingSecurityScopedResource()
         defer { if accessed { url.stopAccessingSecurityScopedResource() } }
 
@@ -736,11 +1208,11 @@ enum CubeLUTManager {
 
         for rawLine in content.components(separatedBy: .newlines) {
             let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
-            if line.isEmpty || line.hasPrefix("#") || line.hasPrefix("TITLE") || line.hasPrefix("DOMAIN_") {
+            if line.isEmpty || line.hasPrefix("#") || line.hasPrefix("TITLE") || line.hasPrefix("DOMAIN_") || line.hasPrefix("LUT_1D_") {
                 continue
             }
             if line.hasPrefix("LUT_3D_SIZE") {
-                let parts = line.split(separator: " ")
+                let parts = line.split(whereSeparator: { $0 == " " || $0 == "\t" })
                 if parts.count >= 2, let parsedSize = Int(parts[1]), parsedSize >= 2 && parsedSize <= 65 {
                     size = parsedSize
                 }
@@ -759,7 +1231,7 @@ enum CubeLUTManager {
         }
 
         guard size > 0, floatValues.count == size * size * size * 4 else {
-            throw NSError(domain: "CubeLUT", code: -1, userInfo: [NSLocalizedDescriptionKey: "无效的 .cube 3D LUT 文件格式（需包含 LUT_3D_SIZE）"])
+            throw NSError(domain: "CubeLUT", code: -1, userInfo: [NSLocalizedDescriptionKey: "无效的 .cube 3D LUT 文件格式（需为标准 3D LUT）"])
         }
 
         let desc = MTLTextureDescriptor()
@@ -787,14 +1259,14 @@ enum CubeLUTManager {
             }
         }
 
-        return (texture, url.deletingPathExtension().lastPathComponent)
+        return (texture, size, url.deletingPathExtension().lastPathComponent)
     }
 
     static func exportCubeFile(grade: ColorGradeParameters) throws -> URL {
         let size = 33
         var lines: [String] = [
-            "# Generated by CineLog 13 Pro Max v3.0 (Blackmagic Cinema Rig Edition)",
-            "TITLE \"CineLog13Pro_\(grade.lookPreset.title)\"",
+            "# Generated by CineLog 13 Pro Max v4.0 (Physical Film Lab Edition)",
+            "TITLE \"CineLog13Pro_\(grade.filmStock.shortName)\"",
             "LUT_3D_SIZE \(size)",
             "DOMAIN_MIN 0.0 0.0 0.0",
             "DOMAIN_MAX 1.0 1.0 1.0"
@@ -813,7 +1285,7 @@ enum CubeLUTManager {
             }
         }
 
-        let fileURL = FileManager.default.temporaryDirectory.appendingPathComponent("CineLog13Pro_Grade.cube")
+        let fileURL = FileManager.default.temporaryDirectory.appendingPathComponent("CineLog13Pro_\(grade.filmStock.shortName).cube")
         try lines.joined(separator: "\n").write(to: fileURL, atomically: true, encoding: .utf8)
         return fileURL
     }
@@ -888,15 +1360,26 @@ enum CubeLUTManager {
     }
 }
 
-// MARK: - 4. Core 10-Bit Apple Log + Focus/Stabilization + Audio VU + Color Grading Engine
+// MARK: - 4. Core 10-Bit Apple Log + Photo/Video + Film Lab + Stabilization Engine
 
 final class AppleLogCameraEngine: NSObject, ObservableObject, @unchecked Sendable {
+    enum EngineRecordingState {
+        case idle
+        case starting
+        case recording
+        case stopping
+    }
+
     // Telemetry & Status
     @Published var isSessionRunning: Bool = false
+    @Published var captureMode: CaptureModeOption = .video
     @Published var isRecording: Bool = false
+    @Published var isCapturingPhoto: Bool = false
+    @Published var showShutterFlash: Bool = false
+    @Published var dualSaveRawAndFilmPhoto: Bool = false
     @Published var recordingDuration: TimeInterval = 0
     @Published var activePipelineBadge: String = "Initializing Cinema Pipeline..."
-    @Published var activeResolutionBadge: String = "4032×3024"
+    @Published var activeResolutionBadge: String = "3840×2160 (10-Bit)"
     @Published var statusMessage: String = "Ready"
     @Published var lastRecordedVideoURL: URL?
 
@@ -906,15 +1389,15 @@ final class AppleLogCameraEngine: NSObject, ObservableObject, @unchecked Sendabl
     @Published var useTimeOfDayTimecode: Bool = false
 
     // Capture Format, Open Gate, Lens, Zoom & Orientation
-    @Published var selectedSensorPreset: SensorFormatPreset = .openGateMax {
+    // Default to uhd4K16x9 for guaranteed native 10-bit BT.2020 HLG + ProRes hardware compatibility on iPhone 13 Pro Max
+    @Published var selectedSensorPreset: SensorFormatPreset = .uhd4K16x9 {
         didSet { reconfigureFormatAndSession() }
     }
     @Published var selectedLens: CameraLensOption = .wideMain {
         didSet { switchCameraLens(selectedLens) }
     }
     @Published var zoomFactor: CGFloat = 1.0
-    @Published var isServoZooming: Bool = false
-    @Published var orientationMode: CaptureOrientationMode = .landscapeRight
+    @Published var orientationMode: CaptureOrientationMode = .portrait
     @Published var autoFollowDeviceOrientation: Bool = false
     @Published var isMirroredHorizontal: Bool = false
     @Published var selectedCodec: RecordingCodecOption = .proRes422
@@ -930,11 +1413,11 @@ final class AppleLogCameraEngine: NSObject, ObservableObject, @unchecked Sendabl
     @Published var deviceRollDegrees: Double = 0.0
     @Published var devicePitchDegrees: Double = 0.0
 
-    // Professional Focus System (CAF / AF-S / MF / Rack Focus A-B / Focus Peaking / Touch Reticle)
+    // Professional Focus System
     @Published var focusMode: FocusControlMode = .continuousAF {
         didSet { applyFocusConfiguration() }
     }
-    @Published var lensPosition: Float = 0.5 // 0.0 = Macro Near, 1.0 = Infinity
+    @Published var lensPosition: Float = 0.5
     @Published var rackPointA: Float = 0.20
     @Published var rackPointB: Float = 0.85
     @Published var rackDurationSeconds: Double = 1.5
@@ -964,14 +1447,14 @@ final class AppleLogCameraEngine: NSObject, ObservableObject, @unchecked Sendabl
     @Published var whiteBalanceKelvin: Float = 5600.0 {
         didSet { applyWhiteBalanceKelvinAndTint() }
     }
-    @Published var whiteBalanceTint: Float = 0.0 { // -150 (Green) to +150 (Magenta)
+    @Published var whiteBalanceTint: Float = 0.0 {
         didSet { applyWhiteBalanceKelvinAndTint() }
     }
     @Published var isWhiteBalanceLocked: Bool = false {
         didSet { toggleWhiteBalanceLock(isWhiteBalanceLocked) }
     }
 
-    // Color Grading & Monitoring Controls
+    // Color Grading, Film Lab & Monitoring Controls
     @Published var grade = ColorGradeParameters()
     @Published var monitorDiagnostic: MonitorDiagnosticMode = .off
     @Published var aspectGuide: AspectGuideOption = .none
@@ -998,15 +1481,17 @@ final class AppleLogCameraEngine: NSObject, ObservableObject, @unchecked Sendabl
     // CoreMotion Gyro Horizon Manager
     private let motionManager = CMMotionManager()
 
-    // Metal Compute & Render Pipeline
+    // Metal Compute, Render & CIContext for High-Bit-Depth Still Photos
     let metalDevice: MTLDevice?
     private(set) var metalLibrary: MTLLibrary?
     private var commandQueue: MTLCommandQueue?
     private var computePipelineState: MTLComputePipelineState?
     private(set) var postGradePipelineState: MTLComputePipelineState?
     private var textureCache: CVMetalTextureCache?
+    private var ciContext: CIContext?
     private var dummy3DLUTTexture: MTLTexture?
     private var custom3DLUTTexture: MTLTexture?
+    private var custom3DLUTSize: Int = 33
 
     private var outputBufferPool: CVPixelBufferPool?
     private var previewBufferPool: CVPixelBufferPool?
@@ -1014,13 +1499,16 @@ final class AppleLogCameraEngine: NSObject, ObservableObject, @unchecked Sendabl
 
     private let previewLock = NSLock()
     private var _latestPreviewTexture: MTLTexture?
+    private var _latestRecordTexture: MTLTexture?
     var latestPreviewTexture: MTLTexture? {
         previewLock.lock()
         defer { previewLock.unlock() }
         return _latestPreviewTexture
     }
 
-    // AVAssetWriter Recording Stack
+    // Rock-Solid Atomic Recording State Machine
+    private let recordingStateLock = NSLock()
+    private var recordingState: EngineRecordingState = .idle
     private var assetWriter: AVAssetWriter?
     private var videoWriterInput: AVAssetWriterInput?
     private var audioWriterInput: AVAssetWriterInput?
@@ -1051,6 +1539,7 @@ final class AppleLogCameraEngine: NSObject, ObservableObject, @unchecked Sendabl
             return
         }
         self.commandQueue = device.makeCommandQueue()
+        self.ciContext = CIContext(mtlDevice: device, options: [.workingColorSpace: CGColorSpace(name: CGColorSpace.displayP3) as Any])
         CVMetalTextureCacheCreate(kCFAllocatorDefault, nil, device, nil, &textureCache)
 
         let lutDesc = MTLTextureDescriptor()
@@ -1130,11 +1619,12 @@ final class AppleLogCameraEngine: NSObject, ObservableObject, @unchecked Sendabl
     func importCustomCubeLUT(from url: URL) {
         guard let device = metalDevice else { return }
         do {
-            let (tex, name) = try CubeLUTManager.loadCubeLUT(from: url, device: device)
+            let (tex, lutSize, name) = try CubeLUTManager.loadCubeLUT(from: url, device: device)
             self.custom3DLUTTexture = tex
-            self.customLUTName = name
+            self.custom3DLUTSize = lutSize
+            self.customLUTName = "\(name) (\(lutSize)³)"
             self.grade.lookPreset = .customCube
-            self.statusMessage = "已加载 3D LUT: \(name)"
+            self.statusMessage = "四面体插值已加载 LUT: \(name)"
         } catch {
             self.statusMessage = error.localizedDescription
         }
@@ -1194,7 +1684,8 @@ final class AppleLogCameraEngine: NSObject, ObservableObject, @unchecked Sendabl
                 captureSession.addInput(audioInput)
             }
 
-            videoDataOutput.alwaysDiscardsLateVideoFrames = false
+            // CRITICAL FIX: Set alwaysDiscardsLateVideoFrames = true so videoProcessingQueue NEVER backs up and blocks Start/Stop Recording!
+            videoDataOutput.alwaysDiscardsLateVideoFrames = true
             videoDataOutput.setSampleBufferDelegate(self, queue: videoProcessingQueue)
             if captureSession.canAddOutput(videoDataOutput) {
                 captureSession.addOutput(videoDataOutput)
@@ -1266,14 +1757,8 @@ final class AppleLogCameraEngine: NSObject, ObservableObject, @unchecked Sendabl
             }
         } else if let device = videoDevice, device.activeFormat.isVideoStabilizationModeSupported(.cinematic) && requested == .cinematicExtended {
             connection.preferredVideoStabilizationMode = .cinematic
-            DispatchQueue.main.async {
-                self.statusMessage = "当前画幅启用 Cinematic 电影防抖"
-            }
         } else if let device = videoDevice, device.activeFormat.isVideoStabilizationModeSupported(.standard) && requested != .off {
             connection.preferredVideoStabilizationMode = .standard
-            DispatchQueue.main.async {
-                self.statusMessage = "当前画幅启用 Standard 标准防抖"
-            }
         } else {
             connection.preferredVideoStabilizationMode = .off
         }
@@ -1333,7 +1818,6 @@ final class AppleLogCameraEngine: NSObject, ObservableObject, @unchecked Sendabl
         }
     }
 
-    /// Smoothly pulls focus from current lensPosition to targetPos over `rackDurationSeconds` (Cinema Follow-Focus Simulation)
     func triggerRackFocus(to targetPos: Float) {
         rackFocusTimer?.invalidate()
         focusMode = .manualFocus
@@ -1351,7 +1835,6 @@ final class AppleLogCameraEngine: NSObject, ObservableObject, @unchecked Sendabl
             }
             let elapsed = CACurrentMediaTime() - startTime
             let progress = Float(min(1.0, elapsed / duration))
-            // Smoothstep ease-in-out curve for organic cinema follow-focus feel
             let smoothT = progress * progress * (3.0 - 2.0 * progress)
             let interpolated = startPos + (endPos - startPos) * smoothT
             self.setManualFocusLensPosition(interpolated)
@@ -1364,12 +1847,10 @@ final class AppleLogCameraEngine: NSObject, ObservableObject, @unchecked Sendabl
         }
     }
 
-    /// Converts normalized viewfinder tap coordinates (0..1, 0..1) to sensor point-of-interest and triggers AF/AE
     func handleViewfinderTap(normalizedPoint: CGPoint, lockFocusAndExposure: Bool = false) {
         focusReticleNormalized = normalizedPoint
         isFocusLockedByTap = lockFocusAndExposure
 
-        // Map upright viewfinder coordinates back to native LandscapeRight sensor coordinates
         let sensorPoint: CGPoint
         switch orientationMode {
         case .portrait:
@@ -1478,6 +1959,7 @@ final class AppleLogCameraEngine: NSObject, ObservableObject, @unchecked Sendabl
         }
     }
 
+    /// Selects the optimal sensor format, prioritizing 10-bit ('x422'/'x420') first to prevent 8-bit banding whenever possible.
     private func selectBestSensorFormat(for device: AVCaptureDevice, preset: SensorFormatPreset, targetFPS: Double) throws {
         let tenBitSubtypes: [OSType] = [
             kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange,
@@ -1527,14 +2009,8 @@ final class AppleLogCameraEngine: NSObject, ObservableObject, @unchecked Sendabl
             }
         }
 
+        // Prioritize 10-bit ('x422'/'x420') + HLG_BT2020 FIRST, then max pixel area!
         let sortedCandidates = candidatePool.sorted { a, b in
-            let dimA = CMVideoFormatDescriptionGetDimensions(a.formatDescription)
-            let dimB = CMVideoFormatDescriptionGetDimensions(b.formatDescription)
-            let areaA = Int64(dimA.width) * Int64(dimA.height)
-            let areaB = Int64(dimB.width) * Int64(dimB.height)
-            if areaA != areaB {
-                return areaA > areaB
-            }
             let subA = CMFormatDescriptionGetMediaSubType(a.formatDescription)
             let subB = CMFormatDescriptionGetMediaSubType(b.formatDescription)
             let is10A = tenBitSubtypes.contains(subA) ? 1 : 0
@@ -1544,7 +2020,14 @@ final class AppleLogCameraEngine: NSObject, ObservableObject, @unchecked Sendabl
             }
             let hlgA = a.supportedColorSpaces.contains(.HLG_BT2020) ? 1 : 0
             let hlgB = b.supportedColorSpaces.contains(.HLG_BT2020) ? 1 : 0
-            return hlgA > hlgB
+            if hlgA != hlgB {
+                return hlgA > hlgB
+            }
+            let dimA = CMVideoFormatDescriptionGetDimensions(a.formatDescription)
+            let dimB = CMVideoFormatDescriptionGetDimensions(b.formatDescription)
+            let areaA = Int64(dimA.width) * Int64(dimA.height)
+            let areaB = Int64(dimB.width) * Int64(dimB.height)
+            return areaA > areaB
         }
 
         guard let activeFormat = sortedCandidates.first ?? fpsCompatibleFormats.first else {
@@ -1634,20 +2117,19 @@ final class AppleLogCameraEngine: NSObject, ObservableObject, @unchecked Sendabl
         let maxISOVal = min(activeFormat.maxISO, 3200.0)
         let currentISOVal = device.iso
         let dims = CMVideoFormatDescriptionGetDimensions(activeFormat.formatDescription)
-        let ratioStr = abs(Double(dims.width) / Double(max(1, dims.height)) - (4.0 / 3.0)) < 0.05 ? "Open Gate 4:3" : "16:9"
-        let bitStr = isTenBit ? "10-Bit BT.2020" : "Wide P3 → 16-Bit"
+        let bitStr = isTenBit ? "10-Bit BT.2020" : "P3 + DeBand 16-Bit"
 
         DispatchQueue.main.async {
             self.minISO = minISOVal
             self.maxISO = maxISOVal
             self.currentISO = currentISOVal
-            self.activeResolutionBadge = "\(dims.width)×\(dims.height) (\(ratioStr))"
-            self.activePipelineBadge = "\(self.selectedLens.focalLabel) • \(bitStr)"
+            self.activeResolutionBadge = "\(dims.width)×\(dims.height) (\(bitStr))"
+            self.activePipelineBadge = "\(self.selectedLens.focalLabel)"
             self.statusMessage = "传感器满血输出已就绪"
         }
     }
 
-    // MARK: - Cinema Exposure & White Balance (Kelvin + Tint)
+    // MARK: - Cinema Exposure & White Balance
 
     func updateExposureAndShutter() {
         sessionQueue.async { [weak self] in
@@ -1720,21 +2202,130 @@ final class AppleLogCameraEngine: NSObject, ObservableObject, @unchecked Sendabl
         }
     }
 
-    // MARK: - 10-Bit ProRes / HEVC Recording Control
+    // MARK: - High-Bit-Depth Still Photo Capture (Captures Full 4032x3024 / 4K Physical Film & Log Stills)
+
+    func captureStillPhoto() {
+        let generator = UIImpactFeedbackGenerator(style: .medium)
+        generator.impactOccurred()
+
+        DispatchQueue.main.async {
+            self.isCapturingPhoto = true
+            withAnimation(.easeOut(duration: 0.12)) {
+                self.showShutterFlash = true
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.14) {
+                withAnimation(.easeIn(duration: 0.15)) {
+                    self.showShutterFlash = false
+                }
+            }
+        }
+
+        videoProcessingQueue.async { [weak self] in
+            guard let self = self else { return }
+            self.previewLock.lock()
+            let gradedTex = self._latestPreviewTexture
+            let rawLogTex = self._latestRecordTexture
+            self.previewLock.unlock()
+
+            guard let targetTex = gradedTex, let ciCtx = self.ciContext else {
+                DispatchQueue.main.async {
+                    self.isCapturingPhoto = false
+                    self.statusMessage = "快门缓冲未就绪，请重试"
+                }
+                return
+            }
+
+            let colorSpace = CGColorSpace(name: CGColorSpace.displayP3) ?? CGColorSpaceCreateDeviceRGB()
+            if var ciImg = CIImage(mtlTexture: targetTex, options: [.colorSpace: colorSpace]) {
+                // Metal texture origin is top-left while CIImage origin is bottom-left; flip vertically so photo is upright
+                ciImg = ciImg.transformed(by: CGAffineTransform(scaleX: 1.0, y: -1.0).translatedBy(x: 0, y: -ciImg.extent.height))
+                if let cgImg = ciCtx.createCGImage(ciImg, from: ciImg.extent, format: .RGBA16, colorSpace: colorSpace) {
+                    let uiImage = UIImage(cgImage: cgImg)
+                    self.savePhotoToLibrary(image: uiImage, label: self.grade.lookPreset == .physicalLab ? self.grade.filmStock.shortName : self.grade.lookPreset.title)
+                }
+            }
+
+            if self.dualSaveRawAndFilmPhoto, let rawTex = rawLogTex,
+               var rawCI = CIImage(mtlTexture: rawTex, options: [.colorSpace: colorSpace]) {
+                rawCI = rawCI.transformed(by: CGAffineTransform(scaleX: 1.0, y: -1.0).translatedBy(x: 0, y: -rawCI.extent.height))
+                if let rawCG = ciCtx.createCGImage(rawCI, from: rawCI.extent, format: .RGBA16, colorSpace: colorSpace) {
+                    let rawUI = UIImage(cgImage: rawCG)
+                    self.savePhotoToLibrary(image: rawUI, label: "AppleLog_Raw")
+                }
+            }
+        }
+    }
+
+    private func savePhotoToLibrary(image: UIImage, label: String) {
+        PHPhotoLibrary.requestAuthorization(for: .addOnly) { status in
+            guard status == .authorized || status == .limited else {
+                DispatchQueue.main.async {
+                    self.isCapturingPhoto = false
+                    self.statusMessage = "请开启相册写入权限以保存照片"
+                }
+                return
+            }
+            PHPhotoLibrary.shared().performChanges({
+                PHAssetChangeRequest.creationRequestForAsset(from: image)
+            }) { success, error in
+                DispatchQueue.main.async {
+                    self.isCapturingPhoto = false
+                    if success {
+                        self.statusMessage = "已保存胶片照片 (\(label)) 至系统相册"
+                    } else {
+                        self.statusMessage = "照片保存失败: \(error?.localizedDescription ?? "未知错误")"
+                    }
+                }
+            }
+        }
+    }
+
+    // MARK: - Rock-Solid 10-Bit ProRes / HEVC Recording Control (Fixes Start/Stop Hang in Portrait & Open Gate)
+
+    func triggerMainShutter() {
+        if captureMode == .photo {
+            captureStillPhoto()
+        } else {
+            toggleRecording()
+        }
+    }
 
     func toggleRecording() {
-        if isRecording {
-            stopRecording()
-        } else {
+        recordingStateLock.lock()
+        let currentState = recordingState
+        recordingStateLock.unlock()
+
+        switch currentState {
+        case .idle:
             startRecording()
+        case .recording:
+            stopRecording()
+        case .starting, .stopping:
+            // Ignore rapid duplicate taps while state transition is in flight
+            break
         }
     }
 
     private func startRecording() {
+        recordingStateLock.lock()
+        guard recordingState == .idle else {
+            recordingStateLock.unlock()
+            return
+        }
+        recordingState = .starting
+        recordingStateLock.unlock()
+
+        let feedback = UIImpactFeedbackGenerator(style: .heavy)
+        feedback.impactOccurred()
+
         videoProcessingQueue.async { [weak self] in
-            guard let self = self, !self.isRecording else { return }
-            let width = Int(self.currentPoolDimensions.width > 0 ? self.currentPoolDimensions.width : 3840)
-            let height = Int(self.currentPoolDimensions.height > 0 ? self.currentPoolDimensions.height : 2160)
+            guard let self = self else { return }
+
+            let rawW = Int(self.currentPoolDimensions.width > 0 ? self.currentPoolDimensions.width : 3840)
+            let rawH = Int(self.currentPoolDimensions.height > 0 ? self.currentPoolDimensions.height : 2160)
+            // Ensure even dimensions for hardware video encoders
+            let width = (rawW / 2) * 2
+            let height = (rawH / 2) * 2
 
             let takeStr = String(format: "T%02d", self.clipTakeNumber)
             let fileName = "\(self.projectReelName)_\(takeStr)_\(width)x\(height)_\(Int(Date().timeIntervalSince1970)).mov"
@@ -1759,18 +2350,36 @@ final class AppleLogCameraEngine: NSObject, ObservableObject, @unchecked Sendabl
                     ]
                 }
 
+                // Hardware ProRes Encoder Check:
+                // On A15 Bionic (iPhone 13 Pro Max), hardware ProRes encoder rejects vertical dimensions > 2160 (e.g. Portrait 3024x4032 or 2160x3840).
+                // We test `writer.canApply(outputSettings:forMediaType:)` first and automatically fall back to 140Mbps 10-Bit HEVC Main10 if ProRes rejects the dimensions!
+                var chosenCodec = self.selectedCodec
                 var videoSettings: [String: Any] = [
-                    AVVideoCodecKey: self.selectedCodec.avCodecType.rawValue,
+                    AVVideoCodecKey: chosenCodec.avCodecType.rawValue,
                     AVVideoWidthKey: width,
                     AVVideoHeightKey: height,
                     AVVideoColorPropertiesKey: colorProperties
                 ]
-
-                if self.selectedCodec == .hevc10Bit {
+                if chosenCodec == .hevc10Bit {
                     videoSettings[AVVideoCompressionPropertiesKey] = [
                         AVVideoProfileLevelKey: kVTProfileLevel_HEVC_Main10_AutoLevel as String,
                         AVVideoAverageBitRateKey: 140_000_000,
                         AVVideoExpectedSourceFrameRateKey: self.selectedFPS.rawValue
+                    ]
+                }
+
+                if !writer.canApply(outputSettings: videoSettings, forMediaType: .video) || (height > 2160 && chosenCodec != .hevc10Bit) {
+                    chosenCodec = .hevc10Bit
+                    videoSettings = [
+                        AVVideoCodecKey: AVVideoCodecType.hevc.rawValue,
+                        AVVideoWidthKey: width,
+                        AVVideoHeightKey: height,
+                        AVVideoColorPropertiesKey: colorProperties,
+                        AVVideoCompressionPropertiesKey: [
+                            AVVideoProfileLevelKey: kVTProfileLevel_HEVC_Main10_AutoLevel as String,
+                            AVVideoAverageBitRateKey: 140_000_000,
+                            AVVideoExpectedSourceFrameRateKey: self.selectedFPS.rawValue
+                        ]
                     ]
                 }
 
@@ -1789,9 +2398,10 @@ final class AppleLogCameraEngine: NSObject, ObservableObject, @unchecked Sendabl
                     sourcePixelBufferAttributes: sourcePixelAttributes
                 )
 
-                if writer.canAdd(vInput) {
-                    writer.add(vInput)
+                guard writer.canAdd(vInput) else {
+                    throw NSError(domain: "CineLog13Pro", code: -21, userInfo: [NSLocalizedDescriptionKey: "编码器不支持当前分辨率 \(width)×\(height)"])
                 }
+                writer.add(vInput)
 
                 let audioSettings: [String: Any] = [
                     AVFormatIDKey: kAudioFormatMPEG4AAC,
@@ -1806,7 +2416,7 @@ final class AppleLogCameraEngine: NSObject, ObservableObject, @unchecked Sendabl
                 }
 
                 guard writer.startWriting() else {
-                    throw writer.error ?? NSError(domain: "CineLog13Pro", code: -20, userInfo: [NSLocalizedDescriptionKey: "AVAssetWriter 启动失败"])
+                    throw writer.error ?? NSError(domain: "CineLog13Pro", code: -22, userInfo: [NSLocalizedDescriptionKey: "AVAssetWriter 启动失败"])
                 }
 
                 self.assetWriter = writer
@@ -1816,37 +2426,96 @@ final class AppleLogCameraEngine: NSObject, ObservableObject, @unchecked Sendabl
                 self.recordingStartTime = nil
                 self.currentOutputURL = outputURL
 
-                let modeDesc = self.grade.bakeGradeIntoRecording ? "直出调色 (\(self.grade.lookPreset.title))" : "纯净 Apple Log"
+                self.recordingStateLock.lock()
+                self.recordingState = .recording
+                self.recordingStateLock.unlock()
+
+                let modeDesc = self.grade.bakeGradeIntoRecording ? "直出 (\(self.grade.filmStock.shortName))" : "纯净 Apple Log"
                 DispatchQueue.main.async {
+                    self.selectedCodec = chosenCodec
                     self.isRecording = true
                     self.recordingDuration = 0
-                    self.statusMessage = "REC \(self.projectReelName)_\(takeStr) • \(modeDesc)"
+                    self.statusMessage = "REC \(chosenCodec.rawValue) • \(modeDesc)"
                 }
             } catch {
+                self.recordingStateLock.lock()
+                self.recordingState = .idle
+                self.recordingStateLock.unlock()
+
                 DispatchQueue.main.async {
-                    self.statusMessage = "录制初始化失败: \(error.localizedDescription)"
+                    self.isRecording = false
+                    self.statusMessage = "录制启动失败: \(error.localizedDescription)"
                 }
             }
         }
     }
 
     private func stopRecording() {
+        recordingStateLock.lock()
+        guard recordingState == .recording else {
+            recordingState = .idle
+            recordingStateLock.unlock()
+            DispatchQueue.main.async { self.isRecording = false }
+            return
+        }
+        recordingState = .stopping
+        recordingStateLock.unlock()
+
+        let feedback = UIImpactFeedbackGenerator(style: .medium)
+        feedback.impactOccurred()
+
         videoProcessingQueue.async { [weak self] in
-            guard let self = self, self.isRecording, let writer = self.assetWriter else { return }
-            self.isRecording = false
+            guard let self = self else { return }
+
+            guard let writer = self.assetWriter else {
+                self.resetRecordingStateToIdle()
+                return
+            }
+
+            let outputURL = self.currentOutputURL
+
+            // If stopRecording was tapped before the very first frame arrived or writer failed, clean up immediately without hanging
+            if writer.status != .writing || self.recordingStartTime == nil {
+                writer.cancelWriting()
+                self.resetRecordingStateToIdle(message: "录制已取消或编码器重置")
+                return
+            }
+
             self.videoWriterInput?.markAsFinished()
             self.audioWriterInput?.markAsFinished()
 
-            let outputURL = self.currentOutputURL
             writer.finishWriting {
-                DispatchQueue.main.async {
-                    self.clipTakeNumber += 1
-                    self.lastRecordedVideoURL = outputURL
-                    self.statusMessage = "正在保存视频至系统相册..."
-                }
+                self.resetRecordingStateToIdle(incrementTake: true, savedURL: outputURL)
                 if let url = outputURL {
                     self.saveVideoToPhotoLibrary(url: url)
                 }
+            }
+        }
+    }
+
+    private func resetRecordingStateToIdle(incrementTake: Bool = false, savedURL: URL? = nil, message: String? = nil) {
+        self.assetWriter = nil
+        self.videoWriterInput = nil
+        self.audioWriterInput = nil
+        self.pixelBufferAdaptor = nil
+        self.recordingStartTime = nil
+
+        recordingStateLock.lock()
+        recordingState = .idle
+        recordingStateLock.unlock()
+
+        DispatchQueue.main.async {
+            self.isRecording = false
+            if incrementTake {
+                self.clipTakeNumber += 1
+            }
+            if let url = savedURL {
+                self.lastRecordedVideoURL = url
+            }
+            if let msg = message {
+                self.statusMessage = msg
+            } else {
+                self.statusMessage = "正在保存视频至系统相册..."
             }
         }
     }
@@ -1874,17 +2543,19 @@ final class AppleLogCameraEngine: NSObject, ObservableObject, @unchecked Sendabl
     }
 
     private func ensurePixelBufferPools(width: Int32, height: Int32) {
-        if currentPoolDimensions.width == width && currentPoolDimensions.height == height &&
+        let evenW = (width / 2) * 2
+        let evenH = (height / 2) * 2
+        if currentPoolDimensions.width == evenW && currentPoolDimensions.height == evenH &&
            outputBufferPool != nil && previewBufferPool != nil {
             return
         }
-        currentPoolDimensions = CMVideoDimensions(width: width, height: height)
+        currentPoolDimensions = CMVideoDimensions(width: evenW, height: evenH)
 
         let poolAttrs: [String: Any] = [kCVPixelBufferPoolMinimumBufferCountKey as String: 6]
         let bufferAttrs: [String: Any] = [
             kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_64RGBAHalf,
-            kCVPixelBufferWidthKey as String: width,
-            kCVPixelBufferHeightKey as String: height,
+            kCVPixelBufferWidthKey as String: evenW,
+            kCVPixelBufferHeightKey as String: evenH,
             kCVPixelBufferIOSurfacePropertiesKey as String: [:] as [String: Any],
             kCVPixelBufferMetalCompatibilityKey as String: true
         ]
@@ -1905,6 +2576,8 @@ extension AppleLogCameraEngine: AVCaptureVideoDataOutputSampleBufferDelegate, AV
         var mirrorHorizontal: Int32
 
         var lookPreset: Int32
+        var lutInputSpace: Int32
+        var customLUTSize: Int32
         var bakeGradeIntoRecording: Int32
         var monitorDiagnosticMode: Int32
         var hasCustom3DLUT: Int32
@@ -1923,7 +2596,19 @@ extension AppleLogCameraEngine: AVCaptureVideoDataOutputSampleBufferDelegate, AV
         var temperatureOffset: Float
         var tintOffset: Float
         var lutIntensity: Float
+
+        var filmStockID: Int32
+        var pushPullStops: Float
+        var halationIntensity: Float
+        var halationRadius: Float
+        var emulsionBloom: Float
+        var lensVignette: Float
+        var chromaticAberration: Float
+        var printPaperContrast: Float
+        var printWarmthSplit: Float
         var filmGrain: Float
+        var grainSize: Float
+        var debandingStrength: Float
         var frameTime: Float
 
         var liftRGB: SIMD4<Float>
@@ -1940,6 +2625,8 @@ extension AppleLogCameraEngine: AVCaptureVideoDataOutputSampleBufferDelegate, AV
             rotationMode: Int32(orientationMode.rawValue),
             mirrorHorizontal: isMirroredHorizontal ? 1 : 0,
             lookPreset: Int32(g.lookPreset.rawValue),
+            lutInputSpace: Int32(g.lutInputSpace.rawValue),
+            customLUTSize: Int32(custom3DLUTSize),
             bakeGradeIntoRecording: g.bakeGradeIntoRecording ? 1 : 0,
             monitorDiagnosticMode: Int32(monitorDiagnostic.rawValue),
             hasCustom3DLUT: custom3DLUTTexture != nil ? 1 : 0,
@@ -1956,7 +2643,18 @@ extension AppleLogCameraEngine: AVCaptureVideoDataOutputSampleBufferDelegate, AV
             temperatureOffset: g.temperatureOffset,
             tintOffset: g.tintOffset,
             lutIntensity: g.lutIntensity,
+            filmStockID: Int32(g.filmStock.rawValue),
+            pushPullStops: g.pushPullStops,
+            halationIntensity: g.halationIntensity,
+            halationRadius: g.halationRadius,
+            emulsionBloom: g.emulsionBloom,
+            lensVignette: g.lensVignette,
+            chromaticAberration: g.chromaticAberration,
+            printPaperContrast: g.printPaperContrast,
+            printWarmthSplit: g.printWarmthSplit,
             filmGrain: g.filmGrain,
+            grainSize: g.grainSize,
+            debandingStrength: g.debandingStrength,
             frameTime: Float(CACurrentMediaTime() - startTimestamp),
             liftRGB: SIMD4<Float>(g.liftR, g.liftG, g.liftB, 0.0),
             gammaRGB: SIMD4<Float>(g.gammaR, g.gammaG, g.gammaB, 0.0),
@@ -1969,7 +2667,11 @@ extension AppleLogCameraEngine: AVCaptureVideoDataOutputSampleBufferDelegate, AV
 
         if output == audioDataOutput {
             updateAudioPeakLevels(from: sampleBuffer)
-            if isRecording,
+            recordingStateLock.lock()
+            let recActive = (recordingState == .recording)
+            recordingStateLock.unlock()
+
+            if recActive,
                let writer = assetWriter,
                writer.status == .writing,
                recordingStartTime != nil,
@@ -1991,8 +2693,10 @@ extension AppleLogCameraEngine: AVCaptureVideoDataOutputSampleBufferDelegate, AV
         let sensorW = CVPixelBufferGetWidth(inputPixelBuffer)
         let sensorH = CVPixelBufferGetHeight(inputPixelBuffer)
 
-        let outW = orientationMode.isPortraitSwapped ? sensorH : sensorW
-        let outH = orientationMode.isPortraitSwapped ? sensorW : sensorH
+        let rawOutW = orientationMode.isPortraitSwapped ? sensorH : sensorW
+        let rawOutH = orientationMode.isPortraitSwapped ? sensorW : sensorH
+        let outW = (rawOutW / 2) * 2
+        let outH = (rawOutH / 2) * 2
         ensurePixelBufferPools(width: Int32(outW), height: Int32(outH))
 
         let lumaW = CVPixelBufferGetWidthOfPlane(inputPixelBuffer, 0)
@@ -2069,24 +2773,35 @@ extension AppleLogCameraEngine: AVCaptureVideoDataOutputSampleBufferDelegate, AV
 
         previewLock.lock()
         _latestPreviewTexture = prevOutTex
+        _latestRecordTexture = logOutTex
         previewLock.unlock()
 
-        if isRecording,
-           let writer = assetWriter,
-           writer.status == .writing,
-           let vInput = videoWriterInput,
-           let adaptor = pixelBufferAdaptor {
-            if recordingStartTime == nil {
-                recordingStartTime = timestamp
-                writer.startSession(atSourceTime: timestamp)
-            }
-            if vInput.isReadyForMoreMediaData {
-                adaptor.append(logOutPB, withPresentationTime: timestamp)
-            }
-            if let start = recordingStartTime {
-                let elapsed = CMTimeGetSeconds(CMTimeSubtract(timestamp, start))
-                DispatchQueue.main.async {
-                    self.recordingDuration = max(0, elapsed)
+        recordingStateLock.lock()
+        let recActive = (recordingState == .recording)
+        recordingStateLock.unlock()
+
+        if recActive, let writer = assetWriter {
+            if writer.status == .failed {
+                let errMsg = writer.error?.localizedDescription ?? "编码器写入异常"
+                resetRecordingStateToIdle(message: "录制异常中断: \(errMsg)")
+            } else if writer.status == .writing,
+                      let vInput = videoWriterInput,
+                      let adaptor = pixelBufferAdaptor {
+                if recordingStartTime == nil {
+                    recordingStartTime = timestamp
+                    writer.startSession(atSourceTime: timestamp)
+                }
+                if vInput.isReadyForMoreMediaData {
+                    if !adaptor.append(logOutPB, withPresentationTime: timestamp) {
+                        let errMsg = writer.error?.localizedDescription ?? "像素缓冲写入失败"
+                        resetRecordingStateToIdle(message: "编码中止: \(errMsg)")
+                    }
+                }
+                if let start = recordingStartTime {
+                    let elapsed = CMTimeGetSeconds(CMTimeSubtract(timestamp, start))
+                    DispatchQueue.main.async {
+                        self.recordingDuration = max(0, elapsed)
+                    }
                 }
             }
         }
@@ -2188,8 +2903,8 @@ extension AppleLogCameraEngine: AVCaptureVideoDataOutputSampleBufferDelegate, AV
                 let naturalSize = try await videoTrack.load(.naturalSize)
                 let preferredTransform = try await videoTrack.load(.preferredTransform)
                 let nominalFPS = try await videoTrack.load(.nominalFrameRate)
-                let width = Int(abs(naturalSize.width))
-                let height = Int(abs(naturalSize.height))
+                let width = (Int(abs(naturalSize.width)) / 2) * 2
+                let height = (Int(abs(naturalSize.height)) / 2) * 2
 
                 let reader = try AVAssetReader(asset: asset)
                 let readerOutput = AVAssetReaderTrackOutput(
@@ -2390,7 +3105,7 @@ struct MetalLogViewfinder: UIViewRepresentable {
     }
 }
 
-// MARK: - 7. Post-Production Color Grading Studio Sheet (后期调色室)
+// MARK: - 7. Post-Production Color Grading & Film Lab Studio Sheet (后期调色室)
 
 struct VideoMovieTransferable: Transferable {
     let url: URL
@@ -2414,7 +3129,7 @@ struct PostColorGradingStudioView: View {
     @State private var activeVideoURL: URL?
     @State private var player: AVPlayer?
     @State private var isExporting: Bool = false
-    @State private var exportStatus: String = "可从相册选择已拍摄的 Log 视频或直接调整上一条录制素材"
+    @State private var exportStatus: String = "可从相册选择已拍摄的 Log 视频或直接冲洗上一条录制素材"
     @State private var showCubeShareSheet: Bool = false
     @State private var exportedCubeURL: URL?
 
@@ -2424,11 +3139,11 @@ struct PostColorGradingStudioView: View {
                 ZStack {
                     RoundedRectangle(cornerRadius: 12)
                         .fill(Color.black)
-                        .frame(height: 240)
+                        .frame(height: 230)
 
                     if let player = player {
                         VideoPlayer(player: player)
-                            .frame(height: 240)
+                            .frame(height: 230)
                             .cornerRadius(12)
                     } else {
                         VStack(spacing: 8) {
@@ -2462,7 +3177,7 @@ struct PostColorGradingStudioView: View {
                             showCubeShareSheet = true
                         }
                     } label: {
-                        Label("导出 .cube LUT", systemImage: "cube.transparent")
+                        Label("导出 .cube", systemImage: "cube.transparent")
                             .font(.system(size: 12, weight: .bold))
                             .padding(.horizontal, 12)
                             .padding(.vertical, 8)
@@ -2476,7 +3191,7 @@ struct PostColorGradingStudioView: View {
                     Button {
                         guard let url = activeVideoURL else { return }
                         isExporting = true
-                        exportStatus = "正在执行 10-Bit GPU 渲染导出..."
+                        exportStatus = "正在执行 10-Bit 物理暗房 GPU 渲染导出..."
                         engine.exportPostGradedVideo(sourceURL: url) { result in
                             isExporting = false
                             switch result {
@@ -2484,7 +3199,7 @@ struct PostColorGradingStudioView: View {
                                 activeVideoURL = gradedURL
                                 player = AVPlayer(url: gradedURL)
                                 player?.play()
-                                exportStatus = "渲染完成！10-Bit 调色成片已存入系统相册"
+                                exportStatus = "冲洗渲染完成！10-Bit 成片已存入系统相册"
                             case .failure(let err):
                                 exportStatus = "渲染失败: \(err.localizedDescription)"
                             }
@@ -2494,7 +3209,7 @@ struct PostColorGradingStudioView: View {
                             if isExporting {
                                 ProgressView().tint(.black)
                             }
-                            Text(isExporting ? "渲染中..." : "渲染导出 10-Bit")
+                            Text(isExporting ? "冲洗中..." : "渲染导出 10-Bit")
                                 .font(.system(size: 12, weight: .bold))
                         }
                         .padding(.horizontal, 14)
@@ -2517,7 +3232,7 @@ struct PostColorGradingStudioView: View {
                 }
             }
             .background(Color(white: 0.08).ignoresSafeArea())
-            .navigationTitle("后期调色室 (Post Grading & LUT)")
+            .navigationTitle("后期胶片暗房 & 调色室")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
@@ -2543,7 +3258,7 @@ struct PostColorGradingStudioView: View {
                         await MainActor.run {
                             activeVideoURL = movie.url
                             player = AVPlayer(url: movie.url)
-                            exportStatus = "已载入视频，调整下方参数后点击「渲染导出 10-Bit」即可生成调色成片"
+                            exportStatus = "已载入视频，调整下方胶片暗房或色轮参数后点击「渲染导出 10-Bit」"
                         }
                     }
                 }
@@ -2566,35 +3281,39 @@ struct ShareSheetView: UIViewControllerRepresentable {
     func updateUIViewController(_ uiViewController: UIActivityViewController, context: Context) {}
 }
 
-// MARK: - 8. Reusable Live & Post Color Grading Control Panel
+// MARK: - 8. Reusable Physical Film Lab & Color Grading Control Panel
 
 struct ColorGradingControlPanel: View {
     @ObservedObject var engine: AppleLogCameraEngine
     @Binding var showCubeImporter: Bool
-    @State private var gradingSubTab: Int = 0
+    @State private var gradingSubTab: Int = 0 // 0 = 物理胶片暗房, 1 = 一级调色 & 去断层, 2 = LGG 三路色轮
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 8) {
-                    ForEach(LookPresetOption.allCases) { preset in
-                        Button {
-                            engine.grade.lookPreset = preset
-                        } label: {
-                            Text(preset.title)
-                                .font(.system(size: 11, weight: .bold, design: .monospaced))
-                                .padding(.horizontal, 10)
-                                .padding(.vertical, 6)
-                                .background(engine.grade.lookPreset == preset ? Color.yellow : Color.white.opacity(0.12))
-                                .foregroundColor(engine.grade.lookPreset == preset ? .black : .white)
-                                .cornerRadius(6)
-                        }
+        VStack(alignment: .leading, spacing: 8) {
+            // Top Mode Selector (Raw Log / Rec.709 / Tetrahedral .cube LUT / Physical Film Lab)
+            HStack(spacing: 6) {
+                ForEach(LookPresetOption.allCases) { preset in
+                    Button {
+                        engine.grade.lookPreset = preset
+                    } label: {
+                        Text(preset.title)
+                            .font(.system(size: 10, weight: .bold, design: .monospaced))
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 6)
+                            .background(engine.grade.lookPreset == preset ? Color.yellow : Color.white.opacity(0.12))
+                            .foregroundColor(engine.grade.lookPreset == preset ? .black : .white)
+                            .cornerRadius(6)
                     }
+                }
+            }
 
+            // If Custom 3D LUT mode is active, show Tetrahedral .cube import & input space selector
+            if engine.grade.lookPreset == .customCube {
+                HStack(spacing: 8) {
                     Button {
                         showCubeImporter = true
                     } label: {
-                        Label("导入 .cube", systemImage: "folder.badge.plus")
+                        Label("导入 .cube (\(engine.customLUTName))", systemImage: "folder.badge.plus")
                             .font(.system(size: 11, weight: .bold, design: .monospaced))
                             .padding(.horizontal, 10)
                             .padding(.vertical, 6)
@@ -2602,13 +3321,21 @@ struct ColorGradingControlPanel: View {
                             .foregroundColor(.cyan)
                             .cornerRadius(6)
                     }
+
+                    Picker("LUT Space", selection: $engine.grade.lutInputSpace) {
+                        ForEach(LUTInputSpaceOption.allCases) { sp in
+                            Text(sp.title).tag(sp)
+                        }
+                    }
+                    .pickerStyle(.segmented)
                 }
             }
 
+            // Bake into Recording Toggle
             HStack {
                 Toggle(isOn: $engine.grade.bakeGradeIntoRecording) {
-                    Text(engine.grade.bakeGradeIntoRecording ? "录制模式：将实时调色烧录直出" : "录制模式：录制纯净 Apple Log（调色仅监看）")
-                        .font(.system(size: 11, weight: .bold, design: .monospaced))
+                    Text(engine.grade.bakeGradeIntoRecording ? "录制视频：烧录物理胶片/调色直出" : "录制视频：保存纯净 Apple Log（胶片仅监看/拍照生效）")
+                        .font(.system(size: 10, weight: .bold, design: .monospaced))
                         .foregroundColor(engine.grade.bakeGradeIntoRecording ? .orange : .green)
                 }
                 .tint(.orange)
@@ -2616,27 +3343,62 @@ struct ColorGradingControlPanel: View {
                 Button("重置") {
                     engine.grade.reset()
                 }
-                .font(.system(size: 11, weight: .bold, design: .monospaced))
+                .font(.system(size: 10, weight: .bold, design: .monospaced))
                 .foregroundColor(.yellow)
             }
 
-            Picker("调色分组", selection: $gradingSubTab) {
-                Text("一级调色 (Primary)").tag(0)
-                Text("三路色轮 (Lift/Gamma/Gain)").tag(1)
-                Text("高光滚降 & 胶片颗粒").tag(2)
+            Picker("工作台分组", selection: $gradingSubTab) {
+                Text("物理胶片暗房").tag(0)
+                Text("一级调色/去断层").tag(1)
+                Text("LGG 三路色轮").tag(2)
             }
             .pickerStyle(.segmented)
 
             if gradingSubTab == 0 {
-                VStack(spacing: 6) {
-                    GradeSliderRow(label: "曝光 EV", value: $engine.grade.exposureEV, range: -2.5...2.5, format: "%+.1f EV", tint: .yellow)
-                    GradeSliderRow(label: "对比度", value: $engine.grade.contrast, range: 0.5...1.6, format: "%.2f", tint: .white)
-                    GradeSliderRow(label: "饱和度", value: $engine.grade.saturation, range: 0.0...2.0, format: "%.2f", tint: .pink)
-                    GradeSliderRow(label: "自然饱和", value: $engine.grade.vibrance, range: -1.0...1.0, format: "%+.2f", tint: .pink)
-                    GradeSliderRow(label: "色温冷暖", value: $engine.grade.temperatureOffset, range: -1.0...1.0, format: "%+.2f", tint: .orange)
-                    GradeSliderRow(label: "色调绿品", value: $engine.grade.tintOffset, range: -1.0...1.0, format: "%+.2f", tint: .green)
+                // Physical Film Emulsion, Optics & Darkroom Chemistry Controls
+                VStack(alignment: .leading, spacing: 6) {
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 6) {
+                            ForEach(PhysicalFilmStockOption.allCases) { stock in
+                                Button {
+                                    engine.grade.applyStockDefaults(stock)
+                                } label: {
+                                    Text(stock.shortName)
+                                        .font(.system(size: 11, weight: .bold, design: .monospaced))
+                                        .padding(.horizontal, 10)
+                                        .padding(.vertical, 6)
+                                        .background(engine.grade.filmStock == stock && engine.grade.lookPreset == .physicalLab ? Color.orange : Color.white.opacity(0.12))
+                                        .foregroundColor(engine.grade.filmStock == stock && engine.grade.lookPreset == .physicalLab ? .black : .white)
+                                        .cornerRadius(6)
+                                }
+                            }
+                        }
+                    }
+
+                    Text(engine.grade.filmStock.chemistryBadge)
+                        .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                        .foregroundColor(.orange)
+
+                    GradeSliderRow(label: "迫冲 Push/Pull", value: $engine.grade.pushPullStops, range: -1.5...2.0, format: "%+.1f 档", tint: .orange)
+                    GradeSliderRow(label: "红光晕 Halation", value: $engine.grade.halationIntensity, range: 0.0...1.0, format: "%.2f", tint: .red)
+                    GradeSliderRow(label: "乳剂柔光 Bloom", value: $engine.grade.emulsionBloom, range: 0.0...1.0, format: "%.2f", tint: .yellow)
+                    GradeSliderRow(label: "相纸反差 Grade", value: $engine.grade.printPaperContrast, range: 0.65...1.45, format: "%.2f", tint: .white)
+                    GradeSliderRow(label: "暗房冷暖染印", value: $engine.grade.printWarmthSplit, range: -1.0...1.0, format: "%+.2f", tint: .cyan)
+                    GradeSliderRow(label: "银盐颗粒密度", value: $engine.grade.filmGrain, range: 0.0...1.0, format: "%.2f", tint: .gray)
+                    GradeSliderRow(label: "光学暗角 cos⁴θ", value: $engine.grade.lensVignette, range: 0.0...1.0, format: "%.2f", tint: .purple)
+                    GradeSliderRow(label: "径向色散 CA", value: $engine.grade.chromaticAberration, range: 0.0...1.0, format: "%.2f", tint: .pink)
                 }
             } else if gradingSubTab == 1 {
+                VStack(spacing: 6) {
+                    GradeSliderRow(label: "去断层平滑", value: $engine.grade.debandingStrength, range: 0.0...1.0, format: "%.2f", tint: .cyan)
+                    GradeSliderRow(label: "曝光补偿 EV", value: $engine.grade.exposureEV, range: -2.5...2.5, format: "%+.1f EV", tint: .yellow)
+                    GradeSliderRow(label: "高光柔和滚降", value: $engine.grade.highlightRollOff, range: 0.0...1.0, format: "%.2f", tint: .orange)
+                    GradeSliderRow(label: "对数对比度", value: $engine.grade.contrast, range: 0.5...1.6, format: "%.2f", tint: .white)
+                    GradeSliderRow(label: "全局饱和度", value: $engine.grade.saturation, range: 0.0...2.0, format: "%.2f", tint: .pink)
+                    GradeSliderRow(label: "色温冷暖偏移", value: $engine.grade.temperatureOffset, range: -1.0...1.0, format: "%+.2f", tint: .orange)
+                    GradeSliderRow(label: "色调绿品偏移", value: $engine.grade.tintOffset, range: -1.0...1.0, format: "%+.2f", tint: .green)
+                }
+            } else {
                 VStack(spacing: 6) {
                     GradeSliderRow(label: "暗部 Lift R", value: $engine.grade.liftR, range: -0.2...0.2, format: "%+.2f", tint: .red)
                     GradeSliderRow(label: "暗部 Lift G", value: $engine.grade.liftG, range: -0.2...0.2, format: "%+.2f", tint: .green)
@@ -2644,14 +3406,6 @@ struct ColorGradingControlPanel: View {
                     GradeSliderRow(label: "中灰 Gamma B", value: $engine.grade.gammaB, range: -0.3...0.3, format: "%+.2f", tint: .cyan)
                     GradeSliderRow(label: "高光 Gain R", value: $engine.grade.gainR, range: 0.7...1.3, format: "%.2f", tint: .orange)
                     GradeSliderRow(label: "高光 Gain B", value: $engine.grade.gainB, range: 0.7...1.3, format: "%.2f", tint: .blue)
-                }
-            } else {
-                VStack(spacing: 6) {
-                    GradeSliderRow(label: "高光滚降", value: $engine.grade.highlightRollOff, range: 0.0...1.0, format: "%.2f", tint: .orange)
-                    GradeSliderRow(label: "暗部提亮", value: $engine.grade.shadowLift, range: -0.25...0.25, format: "%+.2f", tint: .cyan)
-                    GradeSliderRow(label: "反差中心", value: $engine.grade.pivot, range: 0.30...0.65, format: "%.3f", tint: .white)
-                    GradeSliderRow(label: "LUT 浓度", value: $engine.grade.lutIntensity, range: 0.0...1.0, format: "%.2f", tint: .yellow)
-                    GradeSliderRow(label: "胶片颗粒", value: $engine.grade.filmGrain, range: 0.0...1.0, format: "%.2f", tint: .gray)
                 }
             }
         }
@@ -2668,15 +3422,15 @@ struct GradeSliderRow: View {
     var body: some View {
         HStack(spacing: 8) {
             Text(label)
-                .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                .font(.system(size: 10, weight: .semibold, design: .monospaced))
                 .foregroundColor(.white.opacity(0.9))
-                .frame(width: 82, alignment: .leading)
+                .frame(width: 92, alignment: .leading)
             Slider(value: $value, in: range)
                 .tint(tint)
             Text(String(format: format, value))
-                .font(.system(size: 11, weight: .bold, design: .monospaced))
+                .font(.system(size: 10, weight: .bold, design: .monospaced))
                 .foregroundColor(tint)
-                .frame(width: 58, alignment: .trailing)
+                .frame(width: 56, alignment: .trailing)
         }
     }
 }
@@ -2688,8 +3442,8 @@ enum ActiveControlTab: Int, CaseIterable, Identifiable {
     case format   = 1 // 画幅/防抖/方向
     case focus    = 2 // 对焦/峰值/跟焦A-B
     case exposure = 3 // 曝光/快门/白平衡
-    case grading  = 4 // 实时调色/LUT
-    case monitor  = 5 // 假色/遮幅/水平仪
+    case grading  = 4 // 物理胶片/调色/LUT
+    case monitor  = 5 // 假色/遮幅/场记
 
     var id: Int { rawValue }
 }
@@ -2703,7 +3457,6 @@ struct ViewfinderGuidesAndHorizonOverlay: View {
             let h = geo.size.height
 
             ZStack {
-                // 1. Rule-of-Thirds Grid
                 if engine.showGridOverlay {
                     Path { path in
                         path.move(to: CGPoint(x: w / 3.0, y: 0))
@@ -2718,7 +3471,6 @@ struct ViewfinderGuidesAndHorizonOverlay: View {
                     .stroke(Color.white.opacity(0.20), lineWidth: 0.8)
                 }
 
-                // 2. Cinema Aspect Ratio Frame Guides
                 if engine.aspectGuide == .scope239 {
                     let targetH = min(h, w / 2.39)
                     Rectangle()
@@ -2736,18 +3488,15 @@ struct ViewfinderGuidesAndHorizonOverlay: View {
                         .frame(width: targetW * 0.92, height: h * 0.92)
                 }
 
-                // 3. Blackmagic-Style Dual-Axis Gyro Horizon Leveler
                 if engine.showHorizonLeveler {
                     let isLevel = abs(engine.deviceRollDegrees) < 1.2
                     let lineColor: Color = isLevel ? .green : .yellow.opacity(0.85)
 
                     ZStack {
-                        // Fixed Reference Ticks
                         HStack(spacing: 90) {
                             Rectangle().fill(Color.white.opacity(0.5)).frame(width: 14, height: 1.5)
                             Rectangle().fill(Color.white.opacity(0.5)).frame(width: 14, height: 1.5)
                         }
-                        // Rotating Horizon Bar
                         Rectangle()
                             .fill(lineColor)
                             .frame(width: 72, height: 2.0)
@@ -2765,7 +3514,6 @@ struct ViewfinderGuidesAndHorizonOverlay: View {
                     .position(x: w * 0.5, y: h * 0.5)
                 }
 
-                // 4. Touch Focus / Exposure Reticle
                 if let pt = engine.focusReticleNormalized {
                     let reticleColor: Color = engine.isFocusLockedByTap ? .red : .yellow
                     ZStack {
@@ -2787,6 +3535,12 @@ struct ViewfinderGuidesAndHorizonOverlay: View {
                     }
                     .position(x: pt.x * w, y: pt.y * h)
                 }
+
+                // White Flash Overlay on Still Photo Shutter
+                if engine.showShutterFlash {
+                    Color.white.opacity(0.65)
+                        .ignoresSafeArea()
+                }
             }
         }
         .allowsHitTesting(false)
@@ -2801,7 +3555,7 @@ struct LumaHistogramOverlay: View {
             ForEach(0..<bins.count, id: \.self) { index in
                 Rectangle()
                     .fill(index > 58 ? Color.red : (index >= 28 && index <= 34 ? Color.green : Color.white.opacity(0.85)))
-                    .frame(width: 1.6, height: max(2, CGFloat(bins[index]) * 28))
+                    .frame(width: 1.4, height: max(2, CGFloat(bins[index]) * 24))
             }
         }
         .padding(4)
@@ -2811,6 +3565,7 @@ struct LumaHistogramOverlay: View {
             RoundedRectangle(cornerRadius: 6)
                 .stroke(Color.white.opacity(0.2), lineWidth: 0.8)
         )
+        .fixedSize()
     }
 }
 
@@ -2831,41 +3586,42 @@ struct StereoAudioVUMeterView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
-            HStack(spacing: 4) {
+            HStack(spacing: 3) {
                 Text("L")
                     .font(.system(size: 8, weight: .bold, design: .monospaced))
                     .foregroundColor(.gray)
                 ZStack(alignment: .leading) {
                     RoundedRectangle(cornerRadius: 2)
                         .fill(Color.white.opacity(0.15))
-                        .frame(width: 68, height: 5)
+                        .frame(width: 46, height: 4)
                     RoundedRectangle(cornerRadius: 2)
                         .fill(barColor(leftDB))
-                        .frame(width: 68 * normalizedLevel(leftDB), height: 5)
+                        .frame(width: 46 * normalizedLevel(leftDB), height: 4)
                 }
             }
-            HStack(spacing: 4) {
+            HStack(spacing: 3) {
                 Text("R")
                     .font(.system(size: 8, weight: .bold, design: .monospaced))
                     .foregroundColor(.gray)
                 ZStack(alignment: .leading) {
                     RoundedRectangle(cornerRadius: 2)
                         .fill(Color.white.opacity(0.15))
-                        .frame(width: 68, height: 5)
+                        .frame(width: 46, height: 4)
                     RoundedRectangle(cornerRadius: 2)
                         .fill(barColor(rightDB))
-                        .frame(width: 68 * normalizedLevel(rightDB), height: 5)
+                        .frame(width: 46 * normalizedLevel(rightDB), height: 4)
                 }
             }
         }
-        .padding(5)
+        .padding(4)
         .background(Color.black.opacity(0.65))
         .cornerRadius(6)
         .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.white.opacity(0.2), lineWidth: 0.8))
+        .fixedSize()
     }
 }
 
-// MARK: - 10. Main Blackmagic Cinema Camera View
+// MARK: - 10. Main Blackmagic Cinema & Film Camera View (Fixed Top Bar Layout)
 
 struct CineLogCameraView: View {
     @StateObject private var engine = AppleLogCameraEngine()
@@ -2880,7 +3636,7 @@ struct CineLogCameraView: View {
             ZStack {
                 Color.black.ignoresSafeArea()
 
-                // 1. 10-Bit Metal Viewfinder with Single-Tap AF/AE & Long-Press AF/AE Lock
+                // 1. 10-Bit Metal Viewfinder
                 MetalLogViewfinder(engine: engine)
                     .ignoresSafeArea()
                     .gesture(
@@ -2906,13 +3662,13 @@ struct CineLogCameraView: View {
                             }
                     )
 
-                // 2. Horizon Leveler, Aspect Guides & Focus Reticle Overlay
+                // 2. Horizon Leveler, Aspect Guides, Focus Reticle & Shutter Flash
                 ViewfinderGuidesAndHorizonOverlay(engine: engine)
                     .ignoresSafeArea()
 
-                // 3. Blackmagic Camera Style HUD
+                // 3. Clean Non-Wrapping HUD
                 VStack(spacing: 6) {
-                    // Row 1: Blackmagic Top Parameter Pill Bar (Tap any pill to jump to its control drawer)
+                    // Row 1: Scrollable Blackmagic Telemetry Pills
                     ScrollView(.horizontal, showsIndicators: false) {
                         HStack(spacing: 6) {
                             TelemetryPill(label: "RES", value: engine.selectedSensorPreset.shortTitle, accent: .yellow) {
@@ -2945,61 +3701,63 @@ struct CineLogCameraView: View {
                     }
                     .padding(.top, 4)
 
-                    // Row 2: Resolution Status, Orientation Button, Post-Grading Studio, Audio VU & Histogram
-                    HStack(spacing: 8) {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(engine.activeResolutionBadge)
-                                .font(.system(size: 10, weight: .bold, design: .monospaced))
-                                .foregroundColor(.yellow)
-                            Text(engine.statusMessage)
-                                .font(.system(size: 10, weight: .medium, design: .monospaced))
-                                .foregroundColor(.white.opacity(0.85))
-                                .lineLimit(1)
-                        }
-
-                        Spacer()
-
+                    // Row 2: Action Buttons (Orientation + Post Lab) & Audio VU + Histogram (Fixed-Size so text NEVER wraps vertically!)
+                    HStack(spacing: 6) {
                         Button {
                             engine.rotateOrientation90Degrees()
                         } label: {
-                            HStack(spacing: 3) {
+                            HStack(spacing: 4) {
                                 Image(systemName: engine.orientationMode.isPortraitSwapped ? "rectangle.portrait" : "rectangle")
                                 Text(engine.orientationMode.shortLabel)
                             }
-                            .font(.system(size: 10, weight: .bold, design: .monospaced))
-                            .padding(.horizontal, 7)
+                            .font(.system(size: 11, weight: .bold, design: .monospaced))
+                            .padding(.horizontal, 8)
                             .padding(.vertical, 5)
-                            .background(Color.black.opacity(0.7))
+                            .background(Color.black.opacity(0.75))
                             .foregroundColor(.yellow)
                             .cornerRadius(6)
                             .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.yellow.opacity(0.5), lineWidth: 1))
                         }
+                        .fixedSize()
 
                         Button {
                             showPostGradingStudio = true
                         } label: {
-                            HStack(spacing: 3) {
+                            HStack(spacing: 4) {
                                 Image(systemName: "slider.horizontal.below.rectangle")
-                                Text("后期调色")
+                                Text("后期暗房")
                             }
-                            .font(.system(size: 10, weight: .bold, design: .monospaced))
-                            .padding(.horizontal, 7)
+                            .font(.system(size: 11, weight: .bold, design: .monospaced))
+                            .padding(.horizontal, 8)
                             .padding(.vertical, 5)
                             .background(Color.cyan.opacity(0.25))
                             .foregroundColor(.cyan)
                             .cornerRadius(6)
                             .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.cyan.opacity(0.5), lineWidth: 1))
                         }
+                        .fixedSize()
+
+                        Spacer(minLength: 2)
 
                         StereoAudioVUMeterView(leftDB: engine.audioPeakDBLeft, rightDB: engine.audioPeakDBRight)
                         LumaHistogramOverlay(bins: engine.lumaHistogram)
                     }
                     .padding(.horizontal, 12)
 
+                    // Row 3: Compact Single-Line Telemetry Banner
+                    HStack {
+                        Text("\(engine.activeResolutionBadge) • \(engine.statusMessage)")
+                            .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                            .foregroundColor(.white.opacity(0.88))
+                            .lineLimit(1)
+                        Spacer()
+                    }
+                    .padding(.horizontal, 12)
+
                     Spacer()
 
-                    // Quick Floating Lens Bar (0.5x / 1x / 3x + Focus Peaking Quick Button)
-                    HStack(spacing: 12) {
+                    // Floating Lens Bar (0.5x / 1x / 3x + PEAK + Quick Photo Snap Button)
+                    HStack(spacing: 10) {
                         ForEach(CameraLensOption.allCases) { lens in
                             Button {
                                 engine.selectedLens = lens
@@ -3025,6 +3783,23 @@ struct CineLogCameraView: View {
                                 .foregroundColor(engine.focusPeakingEnabled ? .black : .white)
                                 .cornerRadius(19)
                                 .overlay(RoundedRectangle(cornerRadius: 19).stroke(Color.white.opacity(0.25), lineWidth: 1))
+                        }
+
+                        // Dedicated Instant Photo Snap Button (Available even in Video Mode!)
+                        Button {
+                            engine.captureStillPhoto()
+                        } label: {
+                            HStack(spacing: 4) {
+                                Image(systemName: "camera.fill")
+                                Text("抓拍")
+                            }
+                            .font(.system(size: 10, weight: .bold, design: .monospaced))
+                            .padding(.horizontal, 10)
+                            .frame(height: 38)
+                            .background(Color.white.opacity(0.20))
+                            .foregroundColor(.white)
+                            .cornerRadius(19)
+                            .overlay(RoundedRectangle(cornerRadius: 19).stroke(Color.white.opacity(0.35), lineWidth: 1))
                         }
                     }
                     .padding(.bottom, 2)
@@ -3053,15 +3828,15 @@ struct CineLogCameraView: View {
                             }
                         }
                         .padding(12)
-                        .background(Color.black.opacity(0.86))
+                        .background(Color.black.opacity(0.88))
                         .cornerRadius(14)
                         .overlay(RoundedRectangle(cornerRadius: 14).stroke(Color.white.opacity(0.18), lineWidth: 1))
                         .padding(.horizontal, 12)
                         .transition(.move(edge: .bottom).combined(with: .opacity))
                     }
 
-                    // Bottom Control Dock: 5 Cinema Tabs + Shutter Record Bar
-                    VStack(spacing: 8) {
+                    // Bottom Control Dock: 5 Cinema Tabs + Mode Switcher + Shutter Record Bar
+                    VStack(spacing: 6) {
                         HStack(spacing: 6) {
                             DrawerTabButton(title: "画幅/防抖", icon: "gyroscope", isActive: activeTab == .format) {
                                 toggleTab(.format)
@@ -3072,7 +3847,7 @@ struct CineLogCameraView: View {
                             DrawerTabButton(title: "曝光/色温", icon: "camera.aperture", isActive: activeTab == .exposure) {
                                 toggleTab(.exposure)
                             }
-                            DrawerTabButton(title: "实时调色", icon: "paintpalette", isActive: activeTab == .grading) {
+                            DrawerTabButton(title: "胶片暗房", icon: "film", isActive: activeTab == .grading) {
                                 toggleTab(.grading)
                             }
                             DrawerTabButton(title: "辅助/场记", icon: "waveform.path.ecg", isActive: activeTab == .monitor) {
@@ -3081,51 +3856,76 @@ struct CineLogCameraView: View {
                         }
                         .padding(.horizontal, 10)
 
+                        // Video / Photo Mode Selector
+                        HStack(spacing: 20) {
+                            ForEach(CaptureModeOption.allCases) { mode in
+                                Button {
+                                    engine.captureMode = mode
+                                } label: {
+                                    Text(mode.title)
+                                        .font(.system(size: 11, weight: .bold, design: .monospaced))
+                                        .foregroundColor(engine.captureMode == mode ? .yellow : .gray)
+                                }
+                            }
+                        }
+
+                        // Main Shutter & Timecode Bar
                         HStack {
                             VStack(alignment: .leading, spacing: 2) {
                                 Text(formatTimecode(engine.recordingDuration, fps: engine.selectedFPS.rawValue))
                                     .font(.system(size: 16, weight: .bold, design: .monospaced))
                                     .foregroundColor(engine.isRecording ? .red : .white)
-                                Text("\(engine.projectReelName)_T\(String(format: "%02d", engine.clipTakeNumber)) • \(engine.selectedCodec.rawValue)")
+                                Text(engine.grade.lookPreset == .physicalLab ? "胶片: \(engine.grade.filmStock.shortName)" : "色彩: \(engine.grade.lookPreset.title)")
                                     .font(.system(size: 10, weight: .semibold, design: .monospaced))
-                                    .foregroundColor(.yellow)
+                                    .foregroundColor(.orange)
                             }
-                            .frame(width: 150, alignment: .leading)
+                            .frame(width: 145, alignment: .leading)
 
                             Spacer()
 
-                            Button(action: { engine.toggleRecording() }) {
+                            Button(action: { engine.triggerMainShutter() }) {
                                 ZStack {
                                     Circle()
                                         .stroke(Color.white, lineWidth: 3)
                                         .frame(width: 66, height: 66)
-                                    RoundedRectangle(cornerRadius: engine.isRecording ? 8 : 28)
-                                        .fill(Color.red)
-                                        .frame(
-                                            width: engine.isRecording ? 28 : 52,
-                                            height: engine.isRecording ? 28 : 52
-                                        )
-                                        .animation(.easeInOut(duration: 0.2), value: engine.isRecording)
+                                    if engine.captureMode == .photo {
+                                        Circle()
+                                            .fill(Color.white)
+                                            .frame(width: 54, height: 54)
+                                            .overlay(
+                                                Image(systemName: "camera.aperture")
+                                                    .font(.system(size: 20, weight: .bold))
+                                                    .foregroundColor(.black)
+                                            )
+                                    } else {
+                                        RoundedRectangle(cornerRadius: engine.isRecording ? 8 : 28)
+                                            .fill(Color.red)
+                                            .frame(
+                                                width: engine.isRecording ? 28 : 52,
+                                                height: engine.isRecording ? 28 : 52
+                                            )
+                                            .animation(.easeInOut(duration: 0.18), value: engine.isRecording)
+                                    }
                                 }
                             }
 
                             Spacer()
 
                             VStack(alignment: .trailing, spacing: 2) {
-                                Text(engine.grade.bakeGradeIntoRecording ? "REC: 调色直出" : "REC: 纯净 APPLE LOG")
+                                Text(engine.captureMode == .photo ? "模式: 16-Bit 胶片拍照" : (engine.grade.bakeGradeIntoRecording ? "REC: 胶片直出" : "REC: 纯净 APPLE LOG"))
                                     .font(.system(size: 10, weight: .bold, design: .monospaced))
-                                    .foregroundColor(engine.grade.bakeGradeIntoRecording ? .orange : .green)
-                                Text("防抖: \(engine.stabilizationMode.shortTitle) • \(engine.orientationMode.shortLabel)")
+                                    .foregroundColor(engine.captureMode == .photo ? .yellow : (engine.grade.bakeGradeIntoRecording ? .orange : .green))
+                                Text("\(engine.selectedCodec.rawValue) • \(engine.orientationMode.shortLabel)")
                                     .font(.system(size: 10, weight: .semibold, design: .monospaced))
                                     .foregroundColor(.cyan)
                             }
-                            .frame(width: 150, alignment: .trailing)
+                            .frame(width: 145, alignment: .trailing)
                         }
                         .padding(.horizontal, 16)
                         .padding(.bottom, 10)
                     }
-                    .padding(.top, 8)
-                    .background(Color.black.opacity(0.80))
+                    .padding(.top, 6)
+                    .background(Color.black.opacity(0.82))
                 }
             }
         }
@@ -3174,7 +3974,7 @@ struct CineLogCameraView: View {
     }
 }
 
-// MARK: - 11. Sub-Drawer Views (Format/Stabilization, Focus/RackFocus, Exposure/WB, Monitor/Slate)
+// MARK: - 11. Sub-Drawer Views
 
 struct TelemetryPill: View {
     let label: String
@@ -3198,6 +3998,7 @@ struct TelemetryPill: View {
             .cornerRadius(6)
             .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.white.opacity(0.18), lineWidth: 0.8))
         }
+        .fixedSize()
     }
 }
 
@@ -3228,7 +4029,7 @@ struct FormatAndStabilizationDrawer: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text("传感器画幅 (Open Gate / 4K) 与多级专业防抖")
+            Text("传感器画幅 (4K 原生 10-Bit / Open Gate 4:3) 与多级专业防抖")
                 .font(.system(size: 11, weight: .bold, design: .monospaced))
                 .foregroundColor(.yellow)
 
@@ -3260,9 +4061,6 @@ struct FormatAndStabilizationDrawer: View {
                     }
                 }
                 .pickerStyle(.segmented)
-                Text(engine.stabilizationMode.rawValue)
-                    .font(.system(size: 10, design: .monospaced))
-                    .foregroundColor(.gray)
             }
 
             HStack(spacing: 8) {
@@ -3283,7 +4081,7 @@ struct FormatAndStabilizationDrawer: View {
             }
 
             HStack {
-                Text("画面方向:")
+                Text("方向:")
                     .font(.system(size: 10, weight: .bold, design: .monospaced))
                     .foregroundColor(.white)
                 Picker("Orientation", selection: $engine.orientationMode) {
@@ -3293,10 +4091,10 @@ struct FormatAndStabilizationDrawer: View {
                 }
                 .pickerStyle(.segmented)
 
-                Toggle("自动旋转", isOn: $engine.autoFollowDeviceOrientation)
+                Toggle("双存原片+胶片照", isOn: $engine.dualSaveRawAndFilmPhoto)
                     .font(.system(size: 10, weight: .bold, design: .monospaced))
-                    .foregroundColor(.cyan)
-                    .tint(.cyan)
+                    .foregroundColor(.orange)
+                    .tint(.orange)
             }
         }
     }
@@ -3328,7 +4126,6 @@ struct FocusAndZoomDrawer: View {
             }
             .pickerStyle(.segmented)
 
-            // Manual Focus Ring Pull Slider (0.00 Macro -> 1.00 Infinity)
             HStack(spacing: 8) {
                 Text("焦点位置")
                     .font(.system(size: 11, weight: .semibold, design: .monospaced))
@@ -3354,13 +4151,12 @@ struct FocusAndZoomDrawer: View {
                     .frame(width: 40, alignment: .trailing)
             }
 
-            // Programmable A <-> B Cinema Rack Focus
             HStack(spacing: 8) {
                 Text("平滑跟焦:")
                     .font(.system(size: 10, weight: .bold, design: .monospaced))
                     .foregroundColor(.cyan)
 
-                Button("记录 A点(\(String(format: "%.2f", engine.rackPointA)))") {
+                Button("存 A(\(String(format: "%.2f", engine.rackPointA)))") {
                     engine.rackPointA = engine.lensPosition
                 }
                 .font(.system(size: 10, weight: .bold, design: .monospaced))
@@ -3380,7 +4176,7 @@ struct FocusAndZoomDrawer: View {
                 .foregroundColor(.black)
                 .cornerRadius(6)
 
-                Button("记录 B点(\(String(format: "%.2f", engine.rackPointB)))") {
+                Button("存 B(\(String(format: "%.2f", engine.rackPointB)))") {
                     engine.rackPointB = engine.lensPosition
                 }
                 .font(.system(size: 10, weight: .bold, design: .monospaced))
@@ -3401,7 +4197,6 @@ struct FocusAndZoomDrawer: View {
                 .cornerRadius(6)
             }
 
-            // Focus Peaking Controls
             HStack(spacing: 10) {
                 Toggle("峰值对焦 (Focus Peaking)", isOn: $engine.focusPeakingEnabled)
                     .font(.system(size: 11, weight: .bold, design: .monospaced))
@@ -3419,7 +4214,6 @@ struct FocusAndZoomDrawer: View {
                 }
             }
 
-            // Smooth Servo Zoom Slider
             GradeSliderRow(
                 label: "平滑变焦",
                 value: Binding(
@@ -3447,7 +4241,6 @@ struct ExposureAndWBDrawer: View {
 
                 Spacer()
 
-                // Quick Shutter Angle Presets (180° Cinema Rule & Anti-Flicker)
                 ForEach([90.0, 172.8, 180.0, 360.0], id: \.self) { angle in
                     Button("\(Int(angle))°") {
                         engine.isManualExposure = true
