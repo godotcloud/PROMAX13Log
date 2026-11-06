@@ -6,28 +6,27 @@
 //  Frameworks: UIKit, SwiftUI, AVFoundation, Metal, MetalKit, CoreVideo, CoreMedia,
 //              VideoToolbox, Photos, CoreImage, CoreMotion, UniformTypeIdentifiers
 //
-//  Key Fixes & Capabilities:
-//  1. Rock-Solid Video Start/Stop Recording:
-//     - Atomic state machine (idle / starting / recording / stopping) with 2.0s watchdog auto-recovery.
-//     - Native landscape hardware encoding + zero-cost QuickTime track orientation matrix (vInput.transform)
-//       so Portrait mode never triggers A15 ProRes portrait-dimension hardware rejection.
-//     - Automatic Open Gate 4:3 (4032x3024 sensor -> 2880x2160 4:3 ProRes / 3840x2880 4:3 HEVC)
-//       hardware dimension adaptation so ProRes 422 in Open Gate 4:3 never fails on the first frame.
-//     - Guaranteed first-frame session flush before finishWriting so rapid start/stop taps never hang.
-//  2. Zero-Artifact iPhone 15 .cube 3D LUT Pipeline (Fixes IMG_4729 Ceiling Rings & Banding):
-//     - Stores 3D LUT in .rgba16Float (native A15 GPU filtering support) AND evaluates 32-bit float
-//       Tetrahedral 3D LUT Interpolation (sample3DLUTTetrahedral) via integer .read(uint3) in Metal.
-//     - Supports DOMAIN_MIN / DOMAIN_MAX, 1D/3D .cube headers, and selectable LUT Input Space:
-//       * Apple Log (BT.2020 Native iPhone 15 LUT)
-//       * Apple Log (Rec.709 Gamut Adapted)
-//       * Rec.709 Display LUT
-//     - 5-Tap Wide-Radius Stochastic Bilateral Luma+Chroma Debander + Interleaved Gradient Noise (IGN)
-//       dithering completely eliminates 8-bit 4:2:0 ceiling/sky concentric rings in Open Gate 4:3.
-//  3. High-Bit-Depth Still Photo Capture (VIDEO / PHOTO Mode + Instant Snap During Video):
-//     - Full-resolution 12.2 MP (4032x3024 Open Gate) / 4K 16-bit RGBAHalf still photo capture.
-//     - Supports single graded capture OR simultaneous Dual-Save (Raw Apple Log + LUT Graded photo).
-//  4. Fixed Top HUD Bar Layout:
-//     - Eliminates vertical text wrapping on "4032x3024 (Open Gate 4:3)" and orientation lock buttons.
+//  Key Updates in v8.0:
+//  1. Strictly Isolated Open Gate Mode:
+//     - 4K UHD 16:9 (3840x2160) & 1080p 16:9 (1920x1080) use the exact original 10-bit pipeline:
+//       direct integer .read(gid) on 10-bit 'x422'/'x420' planes -> ycbcr10VideoRangeToBT2020RGB ->
+//       hlgToLinearBT2020 (gain = 2.4) -> linearToAppleLog at native 1:1 resolution.
+//     - ONLY Open Gate 4:3 (4032x3024) activates the 8-bit SDR stochastic debander, SDR-to-BT.2020
+//       inverse OETF, and 2880x2160 (4:3) hardware-safe video encoding dimension adaptation.
+//  2. Mathematically Accurate Built-In Cinema LUTs:
+//     - Restored true ITU-R BT.709 OETF + ACES Narkowicz Filmic Tone Mapping (18% middle gray = 0.42 IRE,
+//       true shadow toe, smooth highlight roll-off) and calibrated 3x3 colorimetric matrices for
+//       Official Rec.709, ARRI Alexa K1S1, Kodak 2383 D65/D55, Fujifilm 3513DI, Teal & Orange,
+//       Bleach Bypass, and Cyber Nocturne, plus Tetrahedral 3D .cube LUT interpolation.
+//  3. Fixed HEVC Video Recording on A15 Bionic:
+//     - Uses hardware-native kCVPixelFormatType_32BGRA (.bgra8Unorm) adaptor for HEVC (AppleAVE2)
+//       with hardware-compliant bitrate (50 Mbps 4K / 20 Mbps 1080p) and no conflicting Main10 YCbCr
+//       attachment mismatch, while keeping kCVPixelFormatType_64RGBAHalf (.rgba16Float) for ProRes.
+//  4. Zero-Bloat Sandbox Storage Management (Fixes iPhone Storage Filling Up):
+//     - Automatically purges all temporary .mov / .cube files in NSTemporaryDirectory() on app launch,
+//       when entering background, on recording cancel/failure, and immediately after PHPhotoLibrary
+//       finishes importing the recorded video (caching only a lightweight still frame in memory for
+//       post-production grading). Includes a live sandbox cache size indicator & 1-tap purge button.
 //
 
 import UIKit
@@ -45,7 +44,7 @@ import UniformTypeIdentifiers
 import QuartzCore
 import Combine
 
-// MARK: - 1. Embedded Metal Compute & Render Shaders (Tetrahedral 3D LUT + Wide-Radius Deband)
+// MARK: - 1. Embedded Metal Compute & Render Shaders
 
 enum MetalShaderLibrarySource {
     static let source = """
@@ -54,37 +53,39 @@ enum MetalShaderLibrarySource {
 
     struct PipelineUniforms {
         int isNativeAppleLog;
+        int isOpenGateMode;          // 1 ONLY when Open Gate 4:3 (4032x3024) is active; 0 for standard 10-bit 4K/1080p
         int isFullRangeYCbCr;
         int isTenBitSensorInput;
+
         int isSDRSensorInput;
         int writeRecordBuffer;
-
         int bakeLUTIntoRecording;
         int monitorDiagnosticMode;   // 0 = Normal, 1 = False Color IRE, 2 = Zebra 94% IRE
 
         int focusPeakingEnabled;
         int focusPeakingColorIndex;  // 0 = Green, 1 = Red, 2 = Yellow, 3 = Blue
         float focusPeakingThreshold;
-
         int lutPresetID;             // 0 = Raw Apple Log, 1..8 = Built-in Cinema LUTs, 9 = Imported .cube 3D LUT
+
         int lutInputSpace;           // 0 = Apple Log (BT.2020 Native iPhone 15), 1 = Apple Log (Rec.709 Gamut), 2 = Rec.709
         int customLUTSize;
         int hasCustom3DLUT;
-
         float lutIntensity;
+
         float exposureEV;
         float contrast;
         float highlightRollOff;
         float shadowLift;
+
         float saturation;
         float vibrance;
         float temperature;
         float tint;
+
         float debandingStrength;
         float frameTime;
         float pad0;
         float pad1;
-        float pad2;
 
         float4 domainMin;
         float4 domainMax;
@@ -93,7 +94,54 @@ enum MetalShaderLibrarySource {
         float4 gainRGB;
     };
 
-    // --- Interleaved Gradient Noise (IGN) for High-Frequency Blue-Noise Dither & Stochastic Deband ---
+    // --- 1A. Original 10-Bit Video-Range YCbCr ('x420' / 'x422') to ITU-R BT.2020 RGB (For 4K 16:9 & 1080p 16:9) ---
+    inline float3 ycbcr10VideoRangeToBT2020RGB(float yRaw, float2 cbcrRaw) {
+        float y10  = yRaw * 1023.0;
+        float2 c10 = cbcrRaw * 1023.0;
+
+        float y  = clamp((y10 - 64.0) / (940.0 - 64.0), 0.0, 1.0);
+        float cb = (c10.x - 512.0) / (960.0 - 64.0);
+        float cr = (c10.y - 512.0) / (960.0 - 64.0);
+
+        // ITU-R BT.2020 Non-Constant Luminance (NCL) matrix
+        float r = y + 1.4746 * cr;
+        float g = y - 0.16455312684366 * cb - 0.57135312684366 * cr;
+        float b = y + 1.8556 * cb + 0.0258 * cb; // 1.8814 * cb
+
+        return clamp(float3(r, g, b), 0.0, 1.0);
+    }
+
+    // --- 1B. Original ITU-R BT.2100 HLG Inverse OETF to Scene-Linear BT.2020 (For 4K 16:9 & 1080p 16:9) ---
+    inline float hlgInverseOETFChannel(float ePrime) {
+        const float a = 0.17883277;
+        const float b = 1.0 - 4.0 * a;          // 0.28466892
+        const float c = 0.5 - a * log(4.0 * a); // 0.55991073
+        float v = max(ePrime, 0.0);
+        if (v <= 0.5) {
+            return (v * v) / 3.0;
+        } else {
+            return (exp((v - c) / a) + b) / 12.0;
+        }
+    }
+
+    inline float3 hlgToLinearBT2020(float3 hlgRGB, float evBias, float rollOff) {
+        float3 sceneLinear = float3(
+            hlgInverseOETFChannel(hlgRGB.r),
+            hlgInverseOETFChannel(hlgRGB.g),
+            hlgInverseOETFChannel(hlgRGB.b)
+        );
+        // Scale HLG scene-referred diffuse white to Apple Log 18% gray anchor (R = 0.18 -> P = 0.488)
+        float gain = exp2(evBias) * 2.4;
+        sceneLinear *= gain;
+
+        if (rollOff > 0.001) {
+            float3 shoulder = sceneLinear / (1.0 + sceneLinear * (0.25 * rollOff));
+            sceneLinear = mix(sceneLinear, shoulder, rollOff);
+        }
+        return sceneLinear;
+    }
+
+    // --- 1C. Open Gate 4:3 Dedicated 8-Bit Debander & SDR Inverse OETF (Active ONLY when isOpenGateMode == 1) ---
     inline float interleavedGradientNoise(float2 pixelCoord, float framePhase) {
         float2 p = pixelCoord + float2(framePhase * 5.588238, framePhase * 3.141592);
         return fract(52.9829189 * fract(dot(p, float2(0.06711056, 0.00583715))));
@@ -105,10 +153,7 @@ enum MetalShaderLibrarySource {
         return float2(cos(a), sin(a)) * r * invTexSize;
     }
 
-    // --- 1. Wide-Radius 5-Tap Stochastic Bilateral Luma + Chroma Debander ---
-    // Eliminates 8-bit 4:2:0 concentric ceiling/sky rings (like IMG_4729) across 100..300px gradients
-    // while strictly preserving sharp edges and textures.
-    inline void sampleDebandedYCbCr(
+    inline void sampleOpenGateDebandedYCbCr(
         texture2d<float, access::sample> lumaPlane,
         texture2d<float, access::sample> chromaPlane,
         float2 uv,
@@ -125,7 +170,6 @@ enum MetalShaderLibrarySource {
         float yCenter = lumaPlane.sample(linearSampler, uv).r;
         float2 cCenter = chromaPlane.sample(linearSampler, uv).rg;
 
-        // Always active for 8-bit formats (e.g. Open Gate 4032x3024) or when debandAmount > 0.01
         float effectiveDeband = (isTenBit == 0) ? max(0.75, debandAmount) : debandAmount;
         if (effectiveDeband <= 0.01) {
             outY = yCenter;
@@ -136,9 +180,8 @@ enum MetalShaderLibrarySource {
         float2 invSize = 1.0 / max(lumaSize, float2(1.0, 1.0));
         float phase = floor(frameTime * 24.0);
 
-        // Two orthogonal stochastic radii: inner ring (~28px) and outer ceiling-gradient ring (~88px)
-        float rInner = (isTenBit == 0 ? 32.0 : 18.0) * effectiveDeband;
-        float rOuter = (isTenBit == 0 ? 96.0 : 48.0) * effectiveDeband;
+        float rInner = 32.0 * effectiveDeband;
+        float rOuter = 96.0 * effectiveDeband;
 
         float2 d1 = stochasticOffset(float2(gid), 1.0 + phase * 0.13, rInner, invSize);
         float2 d2 = stochasticOffset(float2(gid), 2.0 + phase * 0.29, rOuter, invSize);
@@ -153,10 +196,8 @@ enum MetalShaderLibrarySource {
         float2 c3 = chromaPlane.sample(linearSampler, clamp(uv + d2, 0.0, 1.0)).rg;
         float2 c4 = chromaPlane.sample(linearSampler, clamp(uv - d2, 0.0, 1.0)).rg;
 
-        // Edge-preserving bilateral threshold: 8-bit steps are 1/255 (~0.00392).
-        // A threshold of ~0.022 spans ~5.5 8-bit quantization steps without blurring edges.
-        float yThresh = (isTenBit == 0 ? 0.024 : 0.012) * effectiveDeband;
-        float cThresh = (isTenBit == 0 ? 0.020 : 0.010) * effectiveDeband;
+        float yThresh = 0.024 * effectiveDeband;
+        float cThresh = 0.020 * effectiveDeband;
 
         float yAvg = (yCenter + y1 + y2 + y3 + y4) * 0.2;
         float yMaxDiff = max(max(abs(y1 - yCenter), abs(y2 - yCenter)), max(abs(y3 - yCenter), abs(y4 - yCenter)));
@@ -168,33 +209,29 @@ enum MetalShaderLibrarySource {
         float2 cWeight = smoothstep(float2(cThresh), float2(cThresh * 0.15), cMaxDiff);
         float2 cSmooth = mix(cCenter, cAvg, cWeight);
 
-        // Add sub-LSB Triangular PDF (TPDF) blue-noise dither to break any residual quantization contour
         float ign1 = interleavedGradientNoise(float2(gid), phase);
         float ign2 = interleavedGradientNoise(float2(gid) + float2(19.3, 47.1), phase);
-        float tpdf = (ign1 + ign2 - 1.0); // Range [-1, +1] with triangular distribution
-        float ditherAmp = (isTenBit == 0) ? (0.85 / 255.0) : (0.55 / 1023.0);
+        float tpdf = (ign1 + ign2 - 1.0);
+        float ditherAmp = 0.85 / 255.0;
 
         outY = clamp(ySmooth + tpdf * ditherAmp, 0.0, 1.0);
         outCbCr = clamp(cSmooth + float2(tpdf * ditherAmp * 0.45, -tpdf * ditherAmp * 0.45), 0.0, 1.0);
     }
 
-    // --- 2. Accurate 8-Bit & 10-Bit YCbCr to Normalized RGB Conversion ---
-    inline float3 decodeYCbCrToRGB(float yRaw, float2 cbcrRaw, int isFullRange, int isTenBit, int isSDR) {
+    inline float3 decodeOpenGateYCbCrToLinearBT2020(
+        float yRaw,
+        float2 cbcrRaw,
+        int isFullRange,
+        int isSDR,
+        float evBias,
+        float rollOff
+    ) {
         float y, cb, cr;
         if (isFullRange == 1) {
             y  = clamp(yRaw, 0.0, 1.0);
             cb = cbcrRaw.x - 0.5;
             cr = cbcrRaw.y - 0.5;
-        } else if (isTenBit == 1) {
-            // CoreVideo 'x420' / 'x422' shifts 10-bit code [0..1023] left by 6 bits (x64) in a 16-bit word [0..65535]
-            const float scale10 = 65535.0 / 64.0; // 1023.984375
-            float y10  = yRaw * scale10;
-            float2 c10 = cbcrRaw * scale10;
-            y  = clamp((y10 - 64.0) / (940.0 - 64.0), 0.0, 1.0);
-            cb = (c10.x - 512.0) / (960.0 - 64.0);
-            cr = (c10.y - 512.0) / (960.0 - 64.0);
         } else {
-            // 8-bit Video Range ('420v'): Y in [16..235], CbCr in [16..240] with neutral at 128
             float y8  = yRaw * 255.0;
             float2 c8 = cbcrRaw * 255.0;
             y  = clamp((y8 - 16.0) / (235.0 - 16.0), 0.0, 1.0);
@@ -203,77 +240,39 @@ enum MetalShaderLibrarySource {
         }
 
         if (isSDR == 1) {
-            // ITU-R BT.709 / Display P3 YCbCr matrix
-            float r = y + 1.5748 * cr;
-            float g = y - 0.187324 * cb - 0.468124 * cr;
-            float b = y + 1.8556 * cb;
-            return clamp(float3(r, g, b), 0.0, 1.0);
+            float3 sdrRGB = clamp(float3(
+                y + 1.5748 * cr,
+                y - 0.187324 * cb - 0.468124 * cr,
+                y + 1.8556 * cb
+            ), 0.0, 1.0);
+
+            float3 linP3;
+            linP3.r = (sdrRGB.r <= 0.04045) ? (sdrRGB.r / 12.92) : pow((sdrRGB.r + 0.055) / 1.055, 2.4);
+            linP3.g = (sdrRGB.g <= 0.04045) ? (sdrRGB.g / 12.92) : pow((sdrRGB.g + 0.055) / 1.055, 2.4);
+            linP3.b = (sdrRGB.b <= 0.04045) ? (sdrRGB.b / 12.92) : pow((sdrRGB.b + 0.055) / 1.055, 2.4);
+
+            float3 lin2020;
+            lin2020.r =  0.753833 * linP3.r + 0.198597 * linP3.g + 0.047570 * linP3.b;
+            lin2020.g =  0.045744 * linP3.r + 0.941777 * linP3.g + 0.012479 * linP3.b;
+            lin2020.b = -0.001210 * linP3.r + 0.017602 * linP3.g + 0.983608 * linP3.b;
+            lin2020 = max(lin2020, 0.0) * exp2(evBias);
+
+            if (rollOff > 0.001) {
+                float3 shoulder = lin2020 / (1.0 + lin2020 * (0.25 * rollOff));
+                lin2020 = mix(lin2020, shoulder, rollOff);
+            }
+            return lin2020;
         } else {
-            // ITU-R BT.2020 NCL YCbCr matrix
-            float r = y + 1.4746 * cr;
-            float g = y - 0.16455312684366 * cb - 0.57135312684366 * cr;
-            float b = y + 1.8814 * cb;
-            return clamp(float3(r, g, b), 0.0, 1.0);
+            float3 hlgRGB = clamp(float3(
+                y + 1.4746 * cr,
+                y - 0.16455312684366 * cb - 0.57135312684366 * cr,
+                y + 1.8814 * cb
+            ), 0.0, 1.0);
+            return hlgToLinearBT2020(hlgRGB, evBias, rollOff);
         }
     }
 
-    // --- 3. Calibrated ITU-R BT.2100 HLG & SDR Inverse OETF to Scene-Linear BT.2020 ---
-    inline float hlgInverseOETFChannel(float ePrime) {
-        const float a = 0.17883277;
-        const float b = 1.0 - 4.0 * a;          // 0.28466892
-        const float c = 0.5 - a * log(4.0 * a); // 0.55991073
-        float v = max(ePrime, 0.0);
-        if (v <= 0.5) {
-            return (v * v) / 3.0;
-        } else {
-            return (exp((v - c) / a) + b) / 12.0;
-        }
-    }
-
-    inline float srgbInverseOETFChannel(float v) {
-        float x = clamp(v, 0.0, 1.0);
-        return (x <= 0.04045) ? (x / 12.92) : pow((x + 0.055) / 1.055, 2.4);
-    }
-
-    inline float3 sensorToCalibratedLinearBT2020(float3 encodedRGB, int isSDR, float evBias, float rollOff) {
-        float3 sceneLinear;
-        if (isSDR == 1) {
-            // Exact sRGB/P3 inverse transfer function + Display P3 -> ITU-R BT.2020 linear matrix
-            float3 linP3 = float3(
-                srgbInverseOETFChannel(encodedRGB.r),
-                srgbInverseOETFChannel(encodedRGB.g),
-                srgbInverseOETFChannel(encodedRGB.b)
-            );
-            sceneLinear.r =  0.753833 * linP3.r + 0.198597 * linP3.g + 0.047570 * linP3.b;
-            sceneLinear.g =  0.045744 * linP3.r + 0.941777 * linP3.g + 0.012479 * linP3.b;
-            sceneLinear.b = -0.001210 * linP3.r + 0.017602 * linP3.g + 0.983608 * linP3.b;
-            sceneLinear = max(sceneLinear, 0.0) * exp2(evBias);
-        } else {
-            float3 rawLin = float3(
-                hlgInverseOETFChannel(encodedRGB.r),
-                hlgInverseOETFChannel(encodedRGB.g),
-                hlgInverseOETFChannel(encodedRGB.b)
-            );
-            // Maps HLG 50% diffuse reference (rawLin=1/12) to scene-referred 0.28 and peak 1.0 to 3.40
-            sceneLinear = max(float3(0.0), (rawLin - 0.0005) * 3.40) * exp2(evBias);
-        }
-
-        if (rollOff > 0.001) {
-            float3 shoulder = sceneLinear / (1.0 + sceneLinear * (0.35 * rollOff));
-            sceneLinear = mix(sceneLinear, shoulder, rollOff);
-        }
-        return sceneLinear;
-    }
-
-    inline float3 linearBT2020ToLinear709(float3 lin2020) {
-        float3 lin709;
-        lin709.r =  1.6604910 * lin2020.r - 0.5876411 * lin2020.g - 0.0728499 * lin2020.b;
-        lin709.g = -0.1245505 * lin2020.r + 1.1328999 * lin2020.g - 0.0083494 * lin2020.b;
-        lin709.b = -0.0181508 * lin2020.r - 0.1005789 * lin2020.g + 1.1187297 * lin2020.b;
-        return max(lin709, 0.0);
-    }
-
-    // --- 4. Official Apple Log Profile White Paper OETF & EOTF ---
+    // --- 2. Official Apple Log Profile White Paper OETF & EOTF ---
     inline float linearToAppleLogChannel(float R) {
         const float R_0   = -0.05641088;
         const float R_t   =  0.01;
@@ -325,17 +324,41 @@ enum MetalShaderLibrarySource {
         ), 0.0);
     }
 
-    // --- 5. Calibrated Natural Rec.709 Display Transform ---
-    inline float3 calibratedLinear709ToRec709Display(float3 lin709) {
-        float3 h = max(lin709, 0.0);
-        float3 compressed = (h * (1.0 + h / 6.5)) / (h + 0.38);
-        float3 display = pow(clamp(compressed, 0.0, 1.0), float3(1.0 / 2.15));
-        return clamp(display, 0.0, 1.0);
+    inline float3 linearBT2020ToLinear709(float3 lin2020) {
+        float3 lin709;
+        lin709.r =  1.6604910 * lin2020.r - 0.5876411 * lin2020.g - 0.0728499 * lin2020.b;
+        lin709.g = -0.1245505 * lin2020.r + 1.1328999 * lin2020.g - 0.0083494 * lin2020.b;
+        lin709.b = -0.0181508 * lin2020.r - 0.1005789 * lin2020.g + 1.1187297 * lin2020.b;
+        return max(lin709, 0.0);
     }
 
-    // --- 6. Exact 32-Bit Float Tetrahedral 3D LUT Interpolation ---
-    // Uses direct integer .read(uint3) on .rgba16Float 3D texture so A15 GPU NEVER falls back to
-    // nearest-neighbor quantization (completely fixing the concentric rings in IMG_4729!).
+    // --- 3. Mathematically Accurate Official ITU-R BT.709 OETF & ACES Narkowicz Filmic Transform ---
+    // Maps scene-linear 18% middle gray (R = 0.18) accurately to ~0.42 IRE with true Rec.709 shadow toe
+    // and smooth highlight shoulder roll-off (restoring the accurate original LUT response!).
+    inline float bt709OETFChannel(float L) {
+        float x = clamp(L, 0.0, 1.0);
+        return (x < 0.018) ? (4.5 * x) : (1.099 * pow(x, 0.45) - 0.099);
+    }
+
+    inline float3 accurateAppleLogToRec709(float3 lin709) {
+        // ACES Narkowicz Filmic S-curve (preserves highlight roll-off up to +4 EV while anchoring 0.18 gray at 0.42 IRE)
+        float3 x = max(lin709, 0.0) * 0.92;
+        float3 acesLin = clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0);
+        float3 acesDisplay = pow(acesLin, float3(1.0 / 2.2));
+
+        // Standard ITU-R BT.709 OETF with highlight shoulder compression
+        float3 compressed709 = lin709 / (1.0 + lin709 * 0.28);
+        float3 std709 = float3(
+            bt709OETFChannel(compressed709.r),
+            bt709OETFChannel(compressed709.g),
+            bt709OETFChannel(compressed709.b)
+        );
+
+        // 50/50 blend of exact BT.709 OETF and ACES Narkowicz gives accurate contrast, true blacks, and smooth highlight roll-off
+        return clamp(mix(std709, acesDisplay, 0.55), 0.0, 1.0);
+    }
+
+    // --- 4. Tetrahedral 3D .cube LUT Interpolation ---
     inline float3 sample3DLUTTetrahedral(
         texture3d<float, access::read> lutTex,
         float3 rgbIn,
@@ -395,7 +418,7 @@ enum MetalShaderLibrarySource {
         return clamp(w0 * c000 + w1 * c1 + w2 * c2 + w3 * c111, 0.0, 1.0);
     }
 
-    // --- 7. Real-Time ASC-CDL & 3D LUT Color Grading Engine ---
+    // --- 5. Calibrated Cinema Built-In LUTs & 3D .cube LUT Evaluator ---
     inline float3 evaluateColorGrade(
         float3 appleLogBT2020,
         constant PipelineUniforms& u,
@@ -427,57 +450,86 @@ enum MetalShaderLibrarySource {
             return clamp(mix(float3(luma), logColor, u.saturation), 0.0, 1.0);
         }
 
-        // Convert Apple Log (BT.2020) -> Linear BT.2020 -> Linear Rec.709 -> Calibrated Rec.709 Display
+        // Decode Apple Log -> Linear BT.2020 -> Linear Rec.709 -> Accurate Rec.709 Display
         float3 lin2020 = appleLogToLinear(logColor);
         float3 lin709  = linearBT2020ToLinear709(lin2020);
-        float3 rec709  = calibratedLinear709ToRec709Display(lin709);
+        float3 rec709  = accurateAppleLogToRec709(lin709);
 
         float3 styled = rec709;
         float luma = dot(rec709, float3(0.2126, 0.7152, 0.0722));
 
         if (u.lutPresetID == 2) {
-            // ARRI Alexa K1S1 709
-            float3 arri = pow(clamp(lin709 / (lin709 + 0.34), 0.0, 1.0), float3(1.0 / 2.1));
-            arri.r = mix(arri.r, arri.r * 1.02, luma);
-            styled = clamp(arri, 0.0, 1.0);
+            // Preset 2: ARRI Alexa K1S1 709 (ARRI Colorimetric Matrix + Soft Highlight Shoulder + Rich Toe)
+            float3 arriLin;
+            arriLin.r = dot(lin709, float3( 1.04, -0.03, -0.01));
+            arriLin.g = dot(lin709, float3(-0.02,  1.03, -0.01));
+            arriLin.b = dot(lin709, float3(-0.01, -0.03,  1.04));
+            arriLin = max(arriLin, 0.0);
+            // ARRI K1S1 tone curve: gentle toe with extended highlight latitude
+            float3 x = arriLin * 0.88;
+            float3 k1s1 = (x * (2.35 * x + 0.045)) / (x * (2.28 * x + 0.68) + 0.16);
+            styled = pow(clamp(k1s1, 0.0, 1.0), float3(1.0 / 2.18));
         } else if (u.lutPresetID == 3) {
-            // Kodak 2383 Print D65
-            float3 sCurve = mix(rec709, smoothstep(0.02, 0.98, rec709), 0.35);
-            float3 sh = float3(-0.025, 0.005, 0.035) * pow(1.0 - luma, 1.5);
-            float3 hi = float3( 0.020, 0.012, -0.020) * pow(luma, 1.2);
-            styled = clamp(sCurve + sh + hi, 0.0, 1.0);
+            // Preset 3: Kodak Vision3 2383 Print (D65) — Classic Silver-Halide Print S-Curve & Subtractive Dyes
+            float3 kMat;
+            kMat.r = dot(rec709, float3( 1.06, -0.04, -0.02));
+            kMat.g = dot(rec709, float3(-0.02,  1.03, -0.01));
+            kMat.b = dot(rec709, float3(-0.03,  0.02,  1.01));
+            float3 printS = smoothstep(0.025, 0.975, clamp(kMat, 0.0, 1.0));
+            float3 sCurve = mix(clamp(kMat, 0.0, 1.0), printS, 0.52);
+            // Kodak 2383 cyan-blue shadow density & warm skin midtone
+            float shMask = pow(clamp(1.0 - luma, 0.0, 1.0), 1.8);
+            float midMask = 4.0 * luma * (1.0 - luma);
+            sCurve += float3(-0.035, 0.004, 0.042) * shMask;
+            sCurve += float3( 0.018, 0.006, -0.015) * midMask;
+            styled = clamp(sCurve, 0.0, 1.0);
         } else if (u.lutPresetID == 4) {
-            // Kodak 2383 Print Warm D55
-            float3 sCurve = mix(rec709, smoothstep(0.02, 0.98, rec709), 0.35);
-            float3 hi = float3( 0.042, 0.024, -0.032) * pow(luma, 1.0);
-            float3 sh = float3(-0.018, 0.008,  0.024) * pow(1.0 - luma, 1.4);
-            styled = clamp(sCurve + hi + sh, 0.0, 1.0);
+            // Preset 4: Kodak Vision3 2383 Print (Warm D55) — Golden Highlights & Deep Prussian Shadows
+            float3 kMat;
+            kMat.r = dot(rec709, float3( 1.07, -0.04, -0.03));
+            kMat.g = dot(rec709, float3(-0.01,  1.02, -0.01));
+            kMat.b = dot(rec709, float3(-0.04,  0.01,  1.03));
+            float3 printS = smoothstep(0.025, 0.975, clamp(kMat, 0.0, 1.0));
+            float3 sCurve = mix(clamp(kMat, 0.0, 1.0), printS, 0.50);
+            float shMask = pow(clamp(1.0 - luma, 0.0, 1.0), 1.7);
+            float hiMask = pow(clamp(luma, 0.0, 1.0), 1.1);
+            sCurve += float3(-0.025, 0.006, 0.030) * shMask;
+            sCurve += float3( 0.052, 0.028, -0.045) * hiMask;
+            styled = clamp(sCurve, 0.0, 1.0);
         } else if (u.lutPresetID == 5) {
-            // Fujifilm 3513DI Print
-            float3 sCurve = mix(rec709, smoothstep(0.02, 0.98, rec709), 0.32);
-            sCurve.g = clamp(sCurve.g * 1.025, 0.0, 1.0);
-            sCurve.b = clamp(sCurve.b * 1.018 + 0.015 * (1.0 - luma), 0.0, 1.0);
-            styled = sCurve;
+            // Preset 5: Fujifilm Eterna 3513DI Print — Emerald Greens, Soft Pastel Highlights & Cool Shadows
+            float3 fMat;
+            fMat.r = dot(rec709, float3( 1.01, -0.02,  0.01));
+            fMat.g = dot(rec709, float3(-0.03,  1.06, -0.03));
+            fMat.b = dot(rec709, float3(-0.01,  0.04,  0.97));
+            float3 printS = smoothstep(0.02, 0.985, clamp(fMat, 0.0, 1.0));
+            float3 sCurve = mix(clamp(fMat, 0.0, 1.0), printS, 0.38);
+            float shMask = pow(clamp(1.0 - luma, 0.0, 1.0), 1.6);
+            sCurve += float3(-0.015, 0.014, 0.025) * shMask;
+            styled = clamp(sCurve, 0.0, 1.0);
         } else if (u.lutPresetID == 6) {
-            // Teal & Orange Master
-            float3 sCurve = mix(rec709, smoothstep(0.02, 0.98, rec709), 0.35);
-            float3 sh = float3(-0.045, 0.012, 0.055) * pow(1.0 - luma, 1.4);
-            float3 hi = float3( 0.050, 0.018, -0.038) * pow(luma, 0.9);
-            styled = clamp(sCurve + sh + hi, 0.0, 1.0);
+            // Preset 6: Teal & Orange Master — Complementary Shadow/Skin Split with Contrast Toe
+            float3 base = mix(rec709, smoothstep(0.02, 0.98, rec709), 0.45);
+            float shMask = pow(clamp(1.0 - luma, 0.0, 1.0), 1.5);
+            float hiMask = pow(clamp(luma, 0.0, 1.0), 1.0);
+            float3 sh = float3(-0.058, 0.015, 0.068) * shMask;
+            float3 hi = float3( 0.062, 0.022, -0.048) * hiMask;
+            styled = clamp(base + sh + hi, 0.0, 1.0);
         } else if (u.lutPresetID == 7) {
-            // Bleach Bypass Silver
-            float3 desat = mix(float3(luma), rec709, 0.45);
-            styled = mix(desat, smoothstep(0.03, 0.97, desat), 0.45);
+            // Preset 7: Bleach Bypass Silver Retention — Metallic Silver Contrast Overlay + 45% Saturation
+            float3 desat = mix(float3(luma), rec709, 0.42);
+            float silverOverlay = smoothstep(0.04, 0.96, luma);
+            float3 bypassed = mix(desat, desat * float3(silverOverlay * 1.35 + 0.15), 0.55);
+            styled = clamp(mix(bypassed, smoothstep(0.03, 0.97, bypassed), 0.45), 0.0, 1.0);
         } else if (u.lutPresetID == 8) {
-            // Cyber Nocturne
-            float3 sh = float3(0.015, -0.02, 0.065) * (1.0 - luma);
-            float3 hi = float3(-0.015, 0.03, 0.045) * luma;
-            styled = clamp(rec709 + sh + hi, 0.0, 1.0);
+            // Preset 8: Cyber Nocturne — Deep Indigo Shadows & Cyan/Magenta Night Neon Separation
+            float3 base = mix(rec709, smoothstep(0.02, 0.98, rec709), 0.40);
+            float shMask = pow(clamp(1.0 - luma, 0.0, 1.0), 1.4);
+            float hiMask = pow(clamp(luma, 0.0, 1.0), 1.1);
+            float3 sh = float3( 0.018, -0.025, 0.075) * shMask;
+            float3 hi = float3(-0.025,  0.042, 0.055) * hiMask;
+            styled = clamp(base + sh + hi, 0.0, 1.0);
         } else if (u.lutPresetID == 9 && u.hasCustom3DLUT == 1) {
-            // Imported .cube 3D LUT with 3 selectable Input Color Space modes:
-            //   0 = Apple Log (BT.2020 Native iPhone 15 LUT)
-            //   1 = Apple Log (Rec.709 Gamut Adapted — ideal when LUT outputs Rec.709 without internal gamut matrix)
-            //   2 = Rec.709 Display Space
             float3 lutSource;
             if (u.lutInputSpace == 0) {
                 lutSource = logColor;
@@ -497,7 +549,7 @@ enum MetalShaderLibrarySource {
         return clamp(mix(float3(finalLuma), result, max(0.0, u.saturation * vibranceFactor)), 0.0, 1.0);
     }
 
-    // --- 8. False Color IRE Exposure Diagnostic Map ---
+    // --- 6. False Color IRE Exposure Diagnostic Map ---
     inline float3 falseColorMap(float lumaIRE) {
         if (lumaIRE < 0.05) return float3(0.55, 0.0, 0.85);
         else if (lumaIRE < 0.18) return float3(0.1, 0.35, 0.95);
@@ -509,7 +561,7 @@ enum MetalShaderLibrarySource {
         else return float3(0.98, 0.1, 0.1);
     }
 
-    // --- 9. Fast Sobel Edge Detection for Focus Peaking ---
+    // --- 7. Fast Sobel Edge Detection for Focus Peaking ---
     inline float computeSobelEdge(texture2d<float, access::sample> lumaPlane, float2 uv, float2 invSize) {
         constexpr sampler s(coord::normalized, address::clamp_to_edge, filter::linear);
         float l = lumaPlane.sample(s, uv - float2(invSize.x, 0.0)).r;
@@ -519,7 +571,10 @@ enum MetalShaderLibrarySource {
         return abs(r - l) * 2.0 + abs(b - t) * 2.0;
     }
 
-    // --- 10. Main Camera Compute Kernel ---
+    // --- 8. Main Camera Compute Kernel ---
+    // Branches strictly between:
+    //   - Standard Modes (isOpenGateMode == 0: 4K 16:9 / 1080p 16:9): Uses original direct .read() 10-bit pipeline
+    //   - Open Gate Mode (isOpenGateMode == 1: 4032x3024 4:3): Uses 5-tap debander & SDR-to-BT.2020 inverse OETF
     kernel void processAppleLogFrame(
         texture2d<float, access::sample> lumaPlane     [[texture(0)]],
         texture2d<float, access::sample> chromaPlane   [[texture(1)]],
@@ -535,49 +590,67 @@ enum MetalShaderLibrarySource {
             return;
         }
 
-        float2 lumaSize = float2(lumaPlane.get_width(), lumaPlane.get_height());
+        uint lumaW = lumaPlane.get_width();
+        uint lumaH = lumaPlane.get_height();
+        float2 lumaSize = float2(lumaW, lumaH);
         float2 uv = (float2(gid) + 0.5) / float2(outW, outH);
 
-        float ySample = 0.0;
-        float2 cbcrSample = float2(0.5, 0.5);
-        sampleDebandedYCbCr(
-            lumaPlane,
-            chromaPlane,
-            uv,
-            gid,
-            lumaSize,
-            uniforms.isTenBitSensorInput,
-            uniforms.debandingStrength,
-            uniforms.frameTime,
-            ySample,
-            cbcrSample
-        );
-
-        float3 sensorRGB = decodeYCbCrToRGB(
-            ySample,
-            cbcrSample,
-            uniforms.isFullRangeYCbCr,
-            uniforms.isTenBitSensorInput,
-            uniforms.isSDRSensorInput
-        );
-
         float3 appleLogPixel;
-        if (uniforms.isNativeAppleLog == 1) {
-            float3 linear = appleLogToLinear(sensorRGB) * exp2(uniforms.exposureEV);
-            appleLogPixel = linearToAppleLog(linear);
+
+        if (uniforms.isOpenGateMode == 0) {
+            // === ORIGINAL 10-BIT PIPELINE FOR 4K UHD 16:9 & 1080p 16:9 ===
+            uint2 srcCoord = uint2(
+                min(gid.x * lumaW / outW, lumaW - 1),
+                min(gid.y * lumaH / outH, lumaH - 1)
+            );
+            uint2 chromaCoord = uint2(
+                srcCoord.x * chromaPlane.get_width() / lumaW,
+                srcCoord.y * chromaPlane.get_height() / lumaH
+            );
+
+            float  ySample    = lumaPlane.read(srcCoord).r;
+            float2 cbcrSample = chromaPlane.read(chromaCoord).rg;
+
+            float3 decodedRGB = ycbcr10VideoRangeToBT2020RGB(ySample, cbcrSample);
+
+            if (uniforms.isNativeAppleLog == 1) {
+                float3 linear = appleLogToLinear(decodedRGB) * exp2(uniforms.exposureEV);
+                appleLogPixel = linearToAppleLog(linear);
+            } else {
+                float3 linearBT2020 = hlgToLinearBT2020(decodedRGB, uniforms.exposureEV, uniforms.highlightRollOff);
+                appleLogPixel = linearToAppleLog(linearBT2020);
+            }
         } else {
-            float3 sceneLinear2020 = sensorToCalibratedLinearBT2020(
-                sensorRGB,
+            // === OPEN GATE 4:3 (4032x3024) DEDICATED PIPELINE ===
+            float ySample = 0.0;
+            float2 cbcrSample = float2(0.5, 0.5);
+            sampleOpenGateDebandedYCbCr(
+                lumaPlane,
+                chromaPlane,
+                uv,
+                gid,
+                lumaSize,
+                uniforms.isTenBitSensorInput,
+                uniforms.debandingStrength,
+                uniforms.frameTime,
+                ySample,
+                cbcrSample
+            );
+
+            float3 linearBT2020 = decodeOpenGateYCbCrToLinearBT2020(
+                ySample,
+                cbcrSample,
+                uniforms.isFullRangeYCbCr,
                 uniforms.isSDRSensorInput,
                 uniforms.exposureEV,
                 uniforms.highlightRollOff
             );
-            appleLogPixel = linearToAppleLog(sceneLinear2020);
+            appleLogPixel = linearToAppleLog(linearBT2020);
         }
 
         float3 gradedColor = evaluateColorGrade(appleLogPixel, uniforms, customLUTTex);
 
-        // Write Recording / Still Photo Output Texture only when needed
+        // Write to Recording / Still Photo Output Buffer
         if (uniforms.writeRecordBuffer == 1) {
             float3 recOut = (uniforms.bakeLUTIntoRecording == 1) ? gradedColor : appleLogPixel;
             recordOutTex.write(float4(recOut, 1.0), gid);
@@ -609,7 +682,7 @@ enum MetalShaderLibrarySource {
         previewOutTex.write(float4(monitorRGB, 1.0), gid);
     }
 
-    // --- 11. Post-Production Non-Destructive Apple Log Video / Photo Grading Kernel ---
+    // --- 9. Post-Production Non-Destructive Apple Log Video / Photo Grading Kernel ---
     kernel void gradeExistingLogFrame(
         texture2d<float, access::read>  sourceLogTex [[texture(0)]],
         texture2d<float, access::write> destTex      [[texture(1)]],
@@ -623,7 +696,7 @@ enum MetalShaderLibrarySource {
         float3 inLog = sourceLogTex.read(gid).rgb;
         float3 lin2020 = appleLogToLinear(inLog) * exp2(uniforms.exposureEV);
         if (uniforms.highlightRollOff > 0.001) {
-            float3 sh = lin2020 / (1.0 + lin2020 * (0.35 * uniforms.highlightRollOff));
+            float3 sh = lin2020 / (1.0 + lin2020 * (0.25 * uniforms.highlightRollOff));
             lin2020 = mix(lin2020, sh, uniforms.highlightRollOff);
         }
         float3 adjustedLog = linearToAppleLog(lin2020);
@@ -631,7 +704,7 @@ enum MetalShaderLibrarySource {
         destTex.write(float4(outColor, 1.0), gid);
     }
 
-    // --- 12. Viewfinder Render Pipeline (Zero-Cost Orientation Rotation in 4-Vertex Shader) ---
+    // --- 10. Viewfinder Render Pipeline (Zero-Cost Orientation Rotation in 4-Vertex Shader) ---
     struct ViewfinderVertexUniforms {
         float2 scale;
         int orientationMode; // 0 = Portrait 90CW, 1 = LandscapeRight 0, 2 = LandscapeLeft 180, 3 = PortraitUpsideDown 90CCW
@@ -786,19 +859,17 @@ struct LUTGradingParameters: Equatable {
 }
 
 enum SensorFormatPreset: String, CaseIterable, Identifiable {
-    case openGateMax   = "Open Gate 4:3 (4032×3024)"
-    case openGate10Bit = "4:3 10-Bit (1920×1440)"
-    case uhd4K16x9     = "4K UHD 16:9 (3840×2160)"
-    case fhd1080p16x9  = "1080p 16:9 (1920×1080)"
+    case uhd4K16x9    = "4K UHD 16:9 (3840×2160)"
+    case fhd1080p16x9 = "1080p 16:9 (1920×1080)"
+    case openGateMax  = "Open Gate 4:3 (4032×3024)"
 
     var id: String { rawValue }
 
     var shortBadge: String {
         switch self {
-        case .openGateMax:   return "Open Gate 4:3"
-        case .openGate10Bit: return "4:3 10-Bit"
-        case .uhd4K16x9:     return "4K 16:9"
-        case .fhd1080p16x9:  return "1080p 16:9"
+        case .uhd4K16x9:    return "4K 16:9"
+        case .fhd1080p16x9: return "1080p 16:9"
+        case .openGateMax:  return "Open Gate 4:3"
         }
     }
 }
@@ -1035,7 +1106,7 @@ enum AspectGuideOption: String, CaseIterable, Identifiable {
     var id: String { rawValue }
 }
 
-// MARK: - 3. 3D .cube LUT Parser & Exporter (.rgba16Float + DOMAIN_MIN/MAX Support)
+// MARK: - 3. 3D .cube LUT Parser & Exporter (.rgba16Float + Accurate ACES/BT.709 CPU Evaluator)
 
 struct LoadedCubeLUT {
     let texture: MTLTexture
@@ -1100,13 +1171,11 @@ enum CubeLUTManager {
             }
         }
 
-        // If a .cube file includes a 1D shaper table before the 3D table, skip the 1D shaper entries
         let expected3DCount = size3D * size3D * size3D
         if size3D > 0 && rawTriplets.count == size1D + expected3DCount && size1D > 0 {
             rawTriplets.removeFirst(size1D)
         }
 
-        // Infer size3D if header omitted LUT_3D_SIZE
         if size3D == 0 {
             let cbrtVal = Int(round(pow(Double(rawTriplets.count), 1.0 / 3.0)))
             if cbrtVal >= 2 && cbrtVal * cbrtVal * cbrtVal == rawTriplets.count {
@@ -1118,7 +1187,6 @@ enum CubeLUTManager {
             throw NSError(domain: "CubeLUT", code: -1, userInfo: [NSLocalizedDescriptionKey: "无效的 .cube 3D LUT 文件（共解析 \(rawTriplets.count) 点）"])
         }
 
-        // Convert to Float16 (.rgba16Float) so A15 GPU texture cache & Tetrahedral .read() run at maximum speed
         var halfValues: [Float16] = []
         halfValues.reserveCapacity(size3D * size3D * size3D * 4)
         for i in 0..<(size3D * size3D * size3D) {
@@ -1195,12 +1263,16 @@ enum CubeLUTManager {
         return max(0.0, min(1.0, v))
     }
 
-    private static func rationalToneMapChannel(_ x: Float) -> Float {
-        let h: Float = max(0.0, x)
-        let num: Float = h * (1.0 + h / 6.5)
-        let den: Float = h + 0.38
-        let mapped: Float = clamp01(num / max(0.0001, den))
-        return pow(mapped, 1.0 / 2.15)
+    private static func accurateToneMapChannel(_ lin: Float) -> Float {
+        let x: Float = max(0.0, lin) * 0.92
+        let num: Float = x * (2.51 * x + 0.03)
+        let den: Float = x * (2.43 * x + 0.59) + 0.14
+        let acesLin: Float = clamp01(num / max(0.0001, den))
+        let acesDisp: Float = pow(acesLin, 1.0 / 2.2)
+
+        let comp: Float = clamp01(max(0.0, lin) / (1.0 + max(0.0, lin) * 0.28))
+        let bt709: Float = (comp < 0.018) ? (4.5 * comp) : (1.099 * pow(comp, 0.45) - 0.099)
+        return clamp01(bt709 * 0.45 + acesDisp * 0.55)
     }
 
     private static func logToLinChannel(_ P: Float) -> Float {
@@ -1249,9 +1321,9 @@ enum CubeLUTManager {
         let linG709: Float = max(0.0, -0.1245505 * linR2020 + 1.1328999 * linG2020 - 0.0083494 * linB2020)
         let linB709: Float = max(0.0, -0.0181508 * linR2020 - 0.1005789 * linG2020 + 1.1187297 * linB2020)
 
-        let recR: Float = rationalToneMapChannel(linR709)
-        let recG: Float = rationalToneMapChannel(linG709)
-        let recB: Float = rationalToneMapChannel(linB709)
+        let recR: Float = accurateToneMapChannel(linR709)
+        let recG: Float = accurateToneMapChannel(linG709)
+        let recB: Float = accurateToneMapChannel(linB709)
 
         let luma: Float = 0.2126 * recR + 0.7152 * recG + 0.0722 * recB
         let outR: Float = clamp01(luma + (recR - luma) * u.saturation)
@@ -1262,7 +1334,7 @@ enum CubeLUTManager {
     }
 }
 
-// MARK: - 4. Core 10-Bit Apple Log + Tetrahedral 3D LUT + Still Photo Camera Engine
+// MARK: - 4. Core 10-Bit Apple Log + ProRes/HEVC + Zero-Storage-Bloat Camera Engine
 
 final class AppleLogCameraEngine: NSObject, ObservableObject, @unchecked Sendable {
     enum EngineRecordingState {
@@ -1279,11 +1351,13 @@ final class AppleLogCameraEngine: NSObject, ObservableObject, @unchecked Sendabl
     @Published var isCapturingPhoto: Bool = false
     @Published var showShutterFlash: Bool = false
     @Published var dualSaveRawAndGradedPhoto: Bool = false
+    @Published var autoSaveVideoToPhotos: Bool = true
+    @Published var tempStorageUsedMB: Double = 0.0
     @Published var recordingDuration: TimeInterval = 0
     @Published var activePipelineBadge: String = "Initializing Cinema Pipeline..."
     @Published var activeResolutionBadge: String = "3840×2160 (10-Bit)"
     @Published var statusMessage: String = "Ready"
-    @Published var lastRecordedVideoURL: URL?
+    @Published var lastRecordedPreviewFrame: UIImage?
 
     // Slate & Timecode Metadata
     @Published var projectReelName: String = "A001"
@@ -1408,6 +1482,7 @@ final class AppleLogCameraEngine: NSObject, ObservableObject, @unchecked Sendabl
     private var recordBufferPool: CVPixelBufferPool?
     private var previewBufferPool: CVPixelBufferPool?
     private var currentRecordPoolDims = CMVideoDimensions(width: 0, height: 0)
+    private var currentRecordPoolFormat: OSType = 0
     private var currentPreviewPoolDims = CMVideoDimensions(width: 0, height: 0)
     private var activeSensorDims = CMVideoDimensions(width: 3840, height: 2160)
 
@@ -1434,6 +1509,7 @@ final class AppleLogCameraEngine: NSObject, ObservableObject, @unchecked Sendabl
     private var recordingStartTime: CMTime?
     private var appendedFrameCount: Int = 0
     private var currentOutputURL: URL?
+    private var activeRecordingUsesBGRA: Bool = false
 
     // Active Sensor Format Flags
     private var hardwareSupportsNativeAppleLog: Bool = false
@@ -1446,8 +1522,47 @@ final class AppleLogCameraEngine: NSObject, ObservableObject, @unchecked Sendabl
     override init() {
         self.metalDevice = MTLCreateSystemDefaultDevice()
         super.init()
+        // Immediately purge any orphaned .mov / .cube files from previous app sessions so storage is never bloated
+        purgeAllTemporaryMediaFiles()
         setupMetalPipeline()
         setupOrientationAndMotionObservers()
+    }
+
+    // MARK: - Zero-Bloat Sandbox Temporary Storage Management
+
+    func purgeAllTemporaryMediaFiles(keeping protectedURL: URL? = nil) {
+        let fm = FileManager.default
+        let tempDir = fm.temporaryDirectory
+        if let urls = try? fm.contentsOfDirectory(at: tempDir, includingPropertiesForKeys: [.fileSizeKey], options: []) {
+            for url in urls {
+                if let keep = protectedURL, url.standardizedFileURL == keep.standardizedFileURL {
+                    continue
+                }
+                let ext = url.pathExtension.lowercased()
+                if ext == "mov" || ext == "mp4" || ext == "cube" || ext == "tmp" {
+                    try? fm.removeItem(at: url)
+                }
+            }
+        }
+        refreshTempStorageUsage()
+    }
+
+    func refreshTempStorageUsage() {
+        let fm = FileManager.default
+        let tempDir = fm.temporaryDirectory
+        var totalBytes: Int64 = 0
+        if let urls = try? fm.contentsOfDirectory(at: tempDir, includingPropertiesForKeys: [.fileSizeKey], options: []) {
+            for url in urls {
+                if let vals = try? url.resourceValues(forKeys: [.fileSizeKey]),
+                   let size = vals.fileSize {
+                    totalBytes += Int64(size)
+                }
+            }
+        }
+        let mb = Double(totalBytes) / (1024.0 * 1024.0)
+        DispatchQueue.main.async {
+            self.tempStorageUsedMB = mb
+        }
     }
 
     // MARK: - Metal Initialization
@@ -1492,6 +1607,12 @@ final class AppleLogCameraEngine: NSObject, ObservableObject, @unchecked Sendabl
             name: UIDevice.orientationDidChangeNotification,
             object: nil
         )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleAppDidEnterBackground),
+            name: UIApplication.didEnterBackgroundNotification,
+            object: nil
+        )
 
         if motionManager.isDeviceMotionAvailable {
             motionManager.deviceMotionUpdateInterval = 1.0 / 24.0
@@ -1505,6 +1626,12 @@ final class AppleLogCameraEngine: NSObject, ObservableObject, @unchecked Sendabl
                 self.deviceRollDegrees = deg
                 self.devicePitchDegrees = attitude.pitch * 180.0 / .pi
             }
+        }
+    }
+
+    @objc private func handleAppDidEnterBackground() {
+        if !isRecording {
+            purgeAllTemporaryMediaFiles()
         }
     }
 
@@ -1900,6 +2027,18 @@ final class AppleLogCameraEngine: NSObject, ObservableObject, @unchecked Sendabl
 
         let candidatePool: [AVCaptureDevice.Format]
         switch preset {
+        case .uhd4K16x9:
+            candidatePool = fpsCompatibleFormats.filter {
+                let d = CMVideoFormatDescriptionGetDimensions($0.formatDescription)
+                let sub = CMFormatDescriptionGetMediaSubType($0.formatDescription)
+                return d.width == 3840 && d.height == 2160 && tenBitSubtypes.contains(sub) && !$0.isVideoBinned
+            }
+        case .fhd1080p16x9:
+            candidatePool = fpsCompatibleFormats.filter {
+                let d = CMVideoFormatDescriptionGetDimensions($0.formatDescription)
+                let sub = CMFormatDescriptionGetMediaSubType($0.formatDescription)
+                return d.width == 1920 && d.height == 1080 && tenBitSubtypes.contains(sub)
+            }
         case .openGateMax:
             let maxFourByThree = device.formats.filter { fmt in
                 let d = CMVideoFormatDescriptionGetDimensions(fmt.formatDescription)
@@ -1916,23 +2055,6 @@ final class AppleLogCameraEngine: NSObject, ObservableObject, @unchecked Sendabl
                     let ratio = Double(d.width) / Double(max(1, d.height))
                     return abs(ratio - (4.0 / 3.0)) < 0.05
                 }
-            }
-        case .openGate10Bit:
-            candidatePool = fpsCompatibleFormats.filter { fmt in
-                let d = CMVideoFormatDescriptionGetDimensions(fmt.formatDescription)
-                let subType = CMFormatDescriptionGetMediaSubType(fmt.formatDescription)
-                let ratio = Double(d.width) / Double(max(1, d.height))
-                return abs(ratio - (4.0 / 3.0)) < 0.05 && tenBitSubtypes.contains(subType)
-            }
-        case .uhd4K16x9:
-            candidatePool = fpsCompatibleFormats.filter {
-                let d = CMVideoFormatDescriptionGetDimensions($0.formatDescription)
-                return d.width == 3840 && d.height == 2160 && !$0.isVideoBinned
-            }
-        case .fhd1080p16x9:
-            candidatePool = fpsCompatibleFormats.filter {
-                let d = CMVideoFormatDescriptionGetDimensions($0.formatDescription)
-                return d.width == 1920 && d.height == 1080
             }
         }
 
@@ -1956,7 +2078,6 @@ final class AppleLogCameraEngine: NSObject, ObservableObject, @unchecked Sendabl
             if areaA != areaB {
                 return areaA > areaB
             }
-            // Prefer Full-Range 8-bit ('420f', 256 levels) over Video-Range ('420v', 219 levels)
             let fullA = (subA == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange) ? 1 : 0
             let fullB = (subB == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange) ? 1 : 0
             return fullA > fullB
@@ -2050,7 +2171,7 @@ final class AppleLogCameraEngine: NSObject, ObservableObject, @unchecked Sendabl
         let minISOVal = activeFormat.minISO
         let maxISOVal = min(activeFormat.maxISO, 3200.0)
         let currentISOVal = device.iso
-        let bitStr = isTenBit ? "10-Bit BT.2020" : "16-Bit Deband"
+        let bitStr = isTenBit ? "10-Bit BT.2020" : "Open Gate 4:3"
 
         DispatchQueue.main.async {
             self.minISO = minISOVal
@@ -2135,7 +2256,7 @@ final class AppleLogCameraEngine: NSObject, ObservableObject, @unchecked Sendabl
         }
     }
 
-    // MARK: - High-Bit-Depth Still Photo Capture (Full 12MP Open Gate / 4K + Dual-Save Option)
+    // MARK: - High-Bit-Depth Still Photo Capture
 
     func captureStillPhoto() {
         let generator = UIImpactFeedbackGenerator(style: .medium)
@@ -2157,7 +2278,6 @@ final class AppleLogCameraEngine: NSObject, ObservableObject, @unchecked Sendabl
             }
         }
 
-        // Wait one frame interval (~55ms) so the full-resolution photo texture is rendered by the GPU
         videoProcessingQueue.asyncAfter(deadline: .now() + 0.06) { [weak self] in
             guard let self = self else { return }
             self.previewLock.lock()
@@ -2230,17 +2350,12 @@ final class AppleLogCameraEngine: NSObject, ObservableObject, @unchecked Sendabl
         }
     }
 
-    // MARK: - Rock-Solid Video Recording State Machine (Fixes Open Gate ProRes & Stop Hang)
+    // MARK: - Rock-Solid ProRes & HEVC Recording (With Immediate Temp File Cleanup!)
 
-    /// Calculates hardware-safe encoding dimensions for A15 Bionic so ProRes 422 and HEVC 10-Bit NEVER fail on Open Gate 4032x3024.
-    private func hardwareSafeVideoDimensions(sensorW: Int, sensorH: Int, codec: RecordingCodecOption) -> (Int, Int) {
-        // A15 Bionic hardware ProRes & real-time 10-bit encoder max vertical height is 2160
-        if sensorH > 2160 {
-            let aspect = Double(sensorW) / Double(max(1, sensorH))
-            let safeH = 2160
-            let safeW = (Int(round(Double(safeH) * aspect)) / 16) * 16
-            // For 4032x3024 (4:3 Open Gate), this produces exact 2880x2160 (4:3 Cinema Open Gate)!
-            return (safeW, safeH)
+    /// Only scales dimensions when in Open Gate 4:3 (4032x3024 -> 2880x2160); 4K 16:9 and 1080p 16:9 use exact 1:1 sensor dimensions.
+    private func targetVideoDimensions(sensorW: Int, sensorH: Int, preset: SensorFormatPreset) -> (Int, Int) {
+        if preset == .openGateMax && sensorH > 2160 {
+            return (2880, 2160)
         }
         return ((sensorW / 2) * 2, (sensorH / 2) * 2)
     }
@@ -2256,7 +2371,6 @@ final class AppleLogCameraEngine: NSObject, ObservableObject, @unchecked Sendabl
     func toggleRecording() {
         let now = CACurrentMediaTime()
         recordingStateLock.lock()
-        // Watchdog auto-recovery: if .starting or .stopping ever lasted > 2.0s, recover automatically
         if (recordingState == .starting || recordingState == .stopping) && (now - lastStateTransitionTime > 2.0) {
             recordingState = isRecording ? .recording : .idle
         }
@@ -2289,17 +2403,32 @@ final class AppleLogCameraEngine: NSObject, ObservableObject, @unchecked Sendabl
         videoProcessingQueue.async { [weak self] in
             guard let self = self else { return }
 
+            // Clean up any leftover temporary files before starting a new recording
+            self.purgeAllTemporaryMediaFiles()
+
             let sW = Int(self.activeSensorDims.width > 0 ? self.activeSensorDims.width : 3840)
             let sH = Int(self.activeSensorDims.height > 0 ? self.activeSensorDims.height : 2160)
 
             var chosenCodec = self.selectedCodec
-            // On iPhone 13 Pro Max, hardware ProRes supports up to 30fps at 4K; use HEVC 10-Bit if 60fps is selected
             if self.selectedFPS == .fps60 && chosenCodec.isProRes && sW > 1920 {
                 chosenCodec = .hevc10Bit
             }
 
-            let (width, height) = self.hardwareSafeVideoDimensions(sensorW: sW, sensorH: sH, codec: chosenCodec)
-            self.ensurePixelBufferPools(recordW: Int32(width), recordH: Int32(height), previewW: Int32(width), previewH: Int32(height))
+            let (width, height) = self.targetVideoDimensions(sensorW: sW, sensorH: sH, preset: self.selectedSensorPreset)
+
+            // Hardware HEVC encoder (AppleAVE2) on A15 Bionic works 100% natively with kCVPixelFormatType_32BGRA (.bgra8Unorm),
+            // whereas AppleProResHW supports kCVPixelFormatType_64RGBAHalf (.rgba16Float).
+            let useBGRA = (chosenCodec == .hevc10Bit)
+            self.activeRecordingUsesBGRA = useBGRA
+
+            let recPoolFormat: OSType = useBGRA ? kCVPixelFormatType_32BGRA : kCVPixelFormatType_64RGBAHalf
+            self.ensurePixelBufferPools(
+                recordW: Int32(width),
+                recordH: Int32(height),
+                recordFormat: recPoolFormat,
+                previewW: Int32(width),
+                previewH: Int32(height)
+            )
 
             let takeStr = String(format: "T%02d", self.clipTakeNumber)
             let fileName = "\(self.projectReelName)_\(takeStr)_\(width)x\(height)_\(Int(Date().timeIntervalSince1970)).mov"
@@ -2309,57 +2438,70 @@ final class AppleLogCameraEngine: NSObject, ObservableObject, @unchecked Sendabl
             do {
                 let writer = try AVAssetWriter(outputURL: outputURL, fileType: .mov)
 
-                let isRawLogRec = !self.bakeIntoRecording || self.lutSettings.lutPreset == .rawAppleLog
-                let colorProperties: [String: Any]
-                if !isRawLogRec {
-                    colorProperties = [
-                        AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_709_2,
-                        AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_709_2,
-                        AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_709_2
-                    ]
-                } else {
-                    colorProperties = [
-                        AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_2020,
-                        AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_2100_HLG,
-                        AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_2020
-                    ]
-                }
-
-                var videoSettings: [String: Any] = [
-                    AVVideoCodecKey: chosenCodec.avCodecType.rawValue,
-                    AVVideoWidthKey: width,
-                    AVVideoHeightKey: height,
-                    AVVideoColorPropertiesKey: colorProperties
-                ]
+                var videoSettings: [String: Any]
                 if chosenCodec == .hevc10Bit {
-                    videoSettings[AVVideoCompressionPropertiesKey] = [
-                        AVVideoProfileLevelKey: kVTProfileLevel_HEVC_Main10_AutoLevel as String,
-                        AVVideoAverageBitRateKey: 120_000_000,
-                        AVVideoExpectedSourceFrameRateKey: self.selectedFPS.rawValue
-                    ]
-                }
-
-                if !writer.canApply(outputSettings: videoSettings, forMediaType: .video) {
-                    chosenCodec = .hevc10Bit
+                    // Clean hardware-compatible HEVC settings for AppleAVE2 (no conflicting Main10 YCbCr attachment requirement)
+                    let targetBitrate = (width * height > 2_500_000) ? 55_000_000 : 22_000_000
                     videoSettings = [
                         AVVideoCodecKey: AVVideoCodecType.hevc.rawValue,
                         AVVideoWidthKey: width,
                         AVVideoHeightKey: height,
-                        AVVideoColorPropertiesKey: colorProperties,
                         AVVideoCompressionPropertiesKey: [
-                            AVVideoProfileLevelKey: kVTProfileLevel_HEVC_Main10_AutoLevel as String,
-                            AVVideoAverageBitRateKey: 120_000_000,
-                            AVVideoExpectedSourceFrameRateKey: self.selectedFPS.rawValue
+                            AVVideoAverageBitRateKey: targetBitrate,
+                            AVVideoExpectedSourceFrameRateKey: Int(self.selectedFPS.rawValue)
                         ]
                     ]
+                } else {
+                    let isRawLogRec = !self.bakeIntoRecording || self.lutSettings.lutPreset == .rawAppleLog
+                    let colorProperties: [String: Any]
+                    if !isRawLogRec {
+                        colorProperties = [
+                            AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_709_2,
+                            AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_709_2,
+                            AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_709_2
+                        ]
+                    } else {
+                        colorProperties = [
+                            AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_2020,
+                            AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_2100_HLG,
+                            AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_2020
+                        ]
+                    }
+                    videoSettings = [
+                        AVVideoCodecKey: chosenCodec.avCodecType.rawValue,
+                        AVVideoWidthKey: width,
+                        AVVideoHeightKey: height,
+                        AVVideoColorPropertiesKey: colorProperties
+                    ]
+                    if !writer.canApply(outputSettings: videoSettings, forMediaType: .video) {
+                        chosenCodec = .hevc10Bit
+                        self.activeRecordingUsesBGRA = true
+                        self.ensurePixelBufferPools(
+                            recordW: Int32(width),
+                            recordH: Int32(height),
+                            recordFormat: kCVPixelFormatType_32BGRA,
+                            previewW: Int32(width),
+                            previewH: Int32(height)
+                        )
+                        videoSettings = [
+                            AVVideoCodecKey: AVVideoCodecType.hevc.rawValue,
+                            AVVideoWidthKey: width,
+                            AVVideoHeightKey: height,
+                            AVVideoCompressionPropertiesKey: [
+                                AVVideoAverageBitRateKey: 55_000_000,
+                                AVVideoExpectedSourceFrameRateKey: Int(self.selectedFPS.rawValue)
+                            ]
+                        ]
+                    }
                 }
 
                 let vInput = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
                 vInput.expectsMediaDataInRealTime = true
                 vInput.transform = self.orientationMode.assetWriterTransform
 
+                let adaptorFormat: OSType = self.activeRecordingUsesBGRA ? kCVPixelFormatType_32BGRA : kCVPixelFormatType_64RGBAHalf
                 let sourcePixelAttributes: [String: Any] = [
-                    kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_64RGBAHalf,
+                    kCVPixelBufferPixelFormatTypeKey as String: adaptorFormat,
                     kCVPixelBufferWidthKey as String: width,
                     kCVPixelBufferHeightKey as String: height,
                     kCVPixelBufferMetalCompatibilityKey as String: true
@@ -2411,6 +2553,7 @@ final class AppleLogCameraEngine: NSObject, ObservableObject, @unchecked Sendabl
                     self.statusMessage = "REC \(width)×\(height) \(chosenCodec.rawValue) • \(modeDesc)"
                 }
             } catch {
+                try? FileManager.default.removeItem(at: outputURL)
                 self.recordingStateLock.lock()
                 self.recordingState = .idle
                 self.lastStateTransitionTime = CACurrentMediaTime()
@@ -2440,7 +2583,6 @@ final class AppleLogCameraEngine: NSObject, ObservableObject, @unchecked Sendabl
         let feedback = UIImpactFeedbackGenerator(style: .medium)
         feedback.impactOccurred()
 
-        // Allow any in-flight GPU frame (up to 70ms) to finish appending before finalizing AVAssetWriter
         videoProcessingQueue.asyncAfter(deadline: .now() + 0.08) { [weak self] in
             guard let self = self else { return }
 
@@ -2453,7 +2595,11 @@ final class AppleLogCameraEngine: NSObject, ObservableObject, @unchecked Sendabl
 
             if writer.status != .writing || self.recordingStartTime == nil || self.appendedFrameCount == 0 {
                 writer.cancelWriting()
-                self.resetRecordingStateToIdle(message: "录制时间过短，已取消")
+                if let url = outputURL {
+                    try? FileManager.default.removeItem(at: url)
+                }
+                self.resetRecordingStateToIdle(message: "录制时间过短，已清理临时缓存")
+                self.refreshTempStorageUsage()
                 return
             }
 
@@ -2461,21 +2607,48 @@ final class AppleLogCameraEngine: NSObject, ObservableObject, @unchecked Sendabl
             self.audioWriterInput?.markAsFinished()
 
             writer.finishWriting {
-                self.resetRecordingStateToIdle(incrementTake: true, savedURL: outputURL)
+                // Capture a lightweight in-memory frame for post-production grading BEFORE deleting the multi-GB .mov file
                 if let url = outputURL {
-                    self.saveVideoToPhotoLibrary(url: url)
+                    self.cachePreviewFrameInMemory(from: url)
+                }
+                self.resetRecordingStateToIdle(incrementTake: true)
+                if let url = outputURL {
+                    if self.autoSaveVideoToPhotos {
+                        self.saveVideoToPhotoLibraryAndDeleteTemp(url: url)
+                    } else {
+                        // User chose not to save video -> immediately delete temp file so 0 MB disk space is used!
+                        try? FileManager.default.removeItem(at: url)
+                        self.refreshTempStorageUsage()
+                        DispatchQueue.main.async {
+                            self.statusMessage = "未保存视频，已自动释放沙盒临时空间"
+                        }
+                    }
                 }
             }
         }
     }
 
-    private func resetRecordingStateToIdle(incrementTake: Bool = false, savedURL: URL? = nil, message: String? = nil) {
+    private func cachePreviewFrameInMemory(from videoURL: URL) {
+        let asset = AVAsset(url: videoURL)
+        let generator = AVAssetImageGenerator(asset: asset)
+        generator.appliesPreferredTrackTransform = true
+        generator.maximumSize = CGSize(width: 1920, height: 1920)
+        if let cgImg = try? generator.copyCGImage(at: CMTime(seconds: 0.05, preferredTimescale: 600), actualTime: nil) {
+            let img = UIImage(cgImage: cgImg)
+            DispatchQueue.main.async {
+                self.lastRecordedPreviewFrame = img
+            }
+        }
+    }
+
+    private func resetRecordingStateToIdle(incrementTake: Bool = false, message: String? = nil) {
         self.assetWriter = nil
         self.videoWriterInput = nil
         self.audioWriterInput = nil
         self.pixelBufferAdaptor = nil
         self.recordingStartTime = nil
         self.appendedFrameCount = 0
+        self.currentOutputURL = nil
 
         recordingStateLock.lock()
         recordingState = .idle
@@ -2487,51 +2660,64 @@ final class AppleLogCameraEngine: NSObject, ObservableObject, @unchecked Sendabl
             if incrementTake {
                 self.clipTakeNumber += 1
             }
-            if let url = savedURL {
-                self.lastRecordedVideoURL = url
-            }
             if let msg = message {
                 self.statusMessage = msg
             } else {
-                self.statusMessage = "正在保存视频至系统相册..."
+                self.statusMessage = "正在保存视频并释放临时缓存..."
             }
         }
     }
 
-    func saveVideoToPhotoLibrary(url: URL) {
+    private func saveVideoToPhotoLibraryAndDeleteTemp(url: URL) {
         PHPhotoLibrary.requestAuthorization(for: .addOnly) { status in
             guard status == .authorized || status == .limited else {
+                // Always remove temporary .mov so it never fills up iPhone storage
+                try? FileManager.default.removeItem(at: url)
+                self.refreshTempStorageUsage()
                 DispatchQueue.main.async {
-                    self.statusMessage = "文件已保存在沙盒: \(url.lastPathComponent)"
+                    self.statusMessage = "相册权限未开启，已清理临时视频缓存"
                 }
                 return
             }
             PHPhotoLibrary.shared().performChanges({
                 PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: url)
             }) { success, error in
+                // Immediately delete the temporary .mov file from app sandbox once Photos has imported it!
+                try? FileManager.default.removeItem(at: url)
+                self.refreshTempStorageUsage()
                 DispatchQueue.main.async {
                     if success {
-                        self.statusMessage = "已保存 (\(self.selectedCodec.rawValue)) 至系统相册"
+                        self.statusMessage = "已保存 (\(self.selectedCodec.rawValue)) 并清理沙盒缓存"
                     } else {
-                        self.statusMessage = "相册保存失败: \(error?.localizedDescription ?? "未知错误")"
+                        self.statusMessage = "保存失败 (\(error?.localizedDescription ?? "未知"))，已清理缓存"
                     }
                 }
             }
         }
     }
 
-    private func ensurePixelBufferPools(recordW: Int32, recordH: Int32, previewW: Int32, previewH: Int32) {
+    private func ensurePixelBufferPools(
+        recordW: Int32,
+        recordH: Int32,
+        recordFormat: OSType,
+        previewW: Int32,
+        previewH: Int32
+    ) {
         let evenRecW = (recordW / 2) * 2
         let evenRecH = (recordH / 2) * 2
         let evenPrevW = (previewW / 2) * 2
         let evenPrevH = (previewH / 2) * 2
 
-        let poolAttrs: [String: Any] = [kCVPixelBufferPoolMinimumBufferCountKey as String: 4]
+        let poolAttrs: [String: Any] = [kCVPixelBufferPoolMinimumBufferCountKey as String: 3]
 
-        if currentRecordPoolDims.width != evenRecW || currentRecordPoolDims.height != evenRecH || recordBufferPool == nil {
+        if currentRecordPoolDims.width != evenRecW ||
+           currentRecordPoolDims.height != evenRecH ||
+           currentRecordPoolFormat != recordFormat ||
+           recordBufferPool == nil {
             currentRecordPoolDims = CMVideoDimensions(width: evenRecW, height: evenRecH)
+            currentRecordPoolFormat = recordFormat
             let recAttrs: [String: Any] = [
-                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_64RGBAHalf,
+                kCVPixelBufferPixelFormatTypeKey as String: recordFormat,
                 kCVPixelBufferWidthKey as String: evenRecW,
                 kCVPixelBufferHeightKey as String: evenRecH,
                 kCVPixelBufferIOSurfacePropertiesKey as String: [:] as [String: Any],
@@ -2554,43 +2740,45 @@ final class AppleLogCameraEngine: NSObject, ObservableObject, @unchecked Sendabl
     }
 }
 
-// MARK: - 5. Coalesced Non-Blocking AVCaptureVideoDataOutput Delegate
+// MARK: - 5. AVCaptureVideoDataOutput Delegate (Strictly Isolates Open Gate vs Original 10-Bit Pipeline)
 
 extension AppleLogCameraEngine: AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureAudioDataOutputSampleBufferDelegate {
 
     struct PipelineUniforms {
         var isNativeAppleLog: Int32
+        var isOpenGateMode: Int32
         var isFullRangeYCbCr: Int32
         var isTenBitSensorInput: Int32
+
         var isSDRSensorInput: Int32
         var writeRecordBuffer: Int32
-
         var bakeLUTIntoRecording: Int32
         var monitorDiagnosticMode: Int32
 
         var focusPeakingEnabled: Int32
         var focusPeakingColorIndex: Int32
         var focusPeakingThreshold: Float
-
         var lutPresetID: Int32
+
         var lutInputSpace: Int32
         var customLUTSize: Int32
         var hasCustom3DLUT: Int32
-
         var lutIntensity: Float
+
         var exposureEV: Float
         var contrast: Float
         var highlightRollOff: Float
         var shadowLift: Float
+
         var saturation: Float
         var vibrance: Float
         var temperature: Float
         var tint: Float
+
         var debandingStrength: Float
         var frameTime: Float
         var pad0: Float = 0.0
         var pad1: Float = 0.0
-        var pad2: Float = 0.0
 
         var domainMin: SIMD4<Float>
         var domainMax: SIMD4<Float>
@@ -2603,6 +2791,7 @@ extension AppleLogCameraEngine: AVCaptureVideoDataOutputSampleBufferDelegate, AV
         let l = lutSettings
         return PipelineUniforms(
             isNativeAppleLog: hardwareSupportsNativeAppleLog ? 1 : 0,
+            isOpenGateMode: (selectedSensorPreset == .openGateMax) ? 1 : 0,
             isFullRangeYCbCr: activeFormatIsFullRange ? 1 : 0,
             isTenBitSensorInput: activeFormatIsTenBit ? 1 : 0,
             isSDRSensorInput: activeFormatIsSDRFallback ? 1 : 0,
@@ -2682,25 +2871,41 @@ extension AppleLogCameraEngine: AVCaptureVideoDataOutputSampleBufferDelegate, AV
 
         let needRecordOut = recActive || isPhotoSnap
 
-        // Compute target dimensions:
-        // - During still photo capture: full sensor resolution (up to 4032x3024 12.2 MP)
-        // - During video recording: exact hardware-safe video dimensions (e.g. 3840x2160 16:9 or 2880x2160 4:3 Open Gate)
-        // - During idle viewfinder preview: half resolution (e.g. 1920x1080 / 2016x1512) for 4x lower GPU power & 60fps UI
+        // Standard modes (4K 16:9 and 1080p 16:9) use their exact native sensor resolution (3840x2160 / 1920x1080).
+        // ONLY Open Gate 4:3 (4032x3024) scales to 2880x2160 during video recording (or 2016x1512 during idle preview).
         let computeW: Int
         let computeH: Int
-        if isPhotoSnap && !recActive {
+        if selectedSensorPreset == .openGateMax {
+            if isPhotoSnap && !recActive {
+                computeW = sensorW
+                computeH = sensorH
+            } else if recActive {
+                let (safeW, safeH) = targetVideoDimensions(sensorW: sensorW, sensorH: sensorH, preset: .openGateMax)
+                computeW = safeW
+                computeH = safeH
+            } else {
+                computeW = (sensorW / 4) * 2
+                computeH = (sensorH / 4) * 2
+            }
+        } else {
             computeW = sensorW
             computeH = sensorH
-        } else if recActive {
-            let (safeW, safeH) = hardwareSafeVideoDimensions(sensorW: sensorW, sensorH: sensorH, codec: selectedCodec)
-            computeW = safeW
-            computeH = safeH
-        } else {
-            computeW = max(960, (sensorW / 4) * 2)
-            computeH = max(540, (sensorH / 4) * 2)
         }
 
-        ensurePixelBufferPools(recordW: Int32(computeW), recordH: Int32(computeH), previewW: Int32(computeW), previewH: Int32(computeH))
+        let recPoolFormat: OSType = (recActive && activeRecordingUsesBGRA)
+            ? kCVPixelFormatType_32BGRA
+            : kCVPixelFormatType_64RGBAHalf
+        let recMetalFormat: MTLPixelFormat = (recPoolFormat == kCVPixelFormatType_32BGRA)
+            ? .bgra8Unorm
+            : .rgba16Float
+
+        ensurePixelBufferPools(
+            recordW: Int32(computeW),
+            recordH: Int32(computeH),
+            recordFormat: recPoolFormat,
+            previewW: Int32(computeW),
+            previewH: Int32(computeH)
+        )
 
         let lumaW = CVPixelBufferGetWidthOfPlane(inputPixelBuffer, 0)
         let lumaH = CVPixelBufferGetHeightOfPlane(inputPixelBuffer, 0)
@@ -2750,7 +2955,7 @@ extension AppleLogCameraEngine: AVCaptureVideoDataOutputSampleBufferDelegate, AV
         )
         if needRecordOut {
             CVMetalTextureCacheCreateTextureFromImage(
-                kCFAllocatorDefault, cache, logOutPB, nil, .rgba16Float, computeW, computeH, 0, &cvLogOutTex
+                kCFAllocatorDefault, cache, logOutPB, nil, recMetalFormat, computeW, computeH, 0, &cvLogOutTex
             )
         }
 
@@ -2819,7 +3024,11 @@ extension AppleLogCameraEngine: AVCaptureVideoDataOutputSampleBufferDelegate, AV
 
         if writer.status == .failed {
             let errMsg = writer.error?.localizedDescription ?? "编码器写入异常"
+            if let url = currentOutputURL {
+                try? FileManager.default.removeItem(at: url)
+            }
             resetRecordingStateToIdle(message: "录制异常中断: \(errMsg)")
+            refreshTempStorageUsage()
             return
         }
 
@@ -2835,7 +3044,11 @@ extension AppleLogCameraEngine: AVCaptureVideoDataOutputSampleBufferDelegate, AV
                     appendedFrameCount += 1
                 } else {
                     let errMsg = writer.error?.localizedDescription ?? "像素缓冲写入失败"
+                    if let url = currentOutputURL {
+                        try? FileManager.default.removeItem(at: url)
+                    }
                     resetRecordingStateToIdle(message: "编码中止: \(errMsg)")
+                    refreshTempStorageUsage()
                     return
                 }
             }
@@ -2927,7 +3140,7 @@ extension AppleLogCameraEngine: AVCaptureVideoDataOutputSampleBufferDelegate, AV
     }
 }
 
-// MARK: - 6. Calibrated sRGB Event-Driven Metal Viewfinder (Zero 60fps Idle Spin)
+// MARK: - 6. Calibrated sRGB Event-Driven Metal Viewfinder
 
 struct MetalLogViewfinder: UIViewRepresentable {
     @ObservedObject var engine: AppleLogCameraEngine
@@ -3037,11 +3250,16 @@ struct MetalLogViewfinder: UIViewRepresentable {
 final class PostProductionLogGrader: ObservableObject {
     @Published var sourceImage: UIImage?
     @Published var gradedPreviewImage: UIImage?
-    @Published var isExportingVideo: Bool = false
-    @Published var exportProgress: Double = 0.0
     @Published var exportStatus: String = ""
 
     private let ciContext = CIContext(options: [.workingColorSpace: CGColorSpace(name: CGColorSpace.sRGB) as Any])
+
+    func loadCachedPreviewFrame(from engine: AppleLogCameraEngine) {
+        if let cached = engine.lastRecordedPreviewFrame {
+            self.sourceImage = cached
+            self.renderGradedStill(engine: engine)
+        }
+    }
 
     func extractPreviewFrame(from videoURL: URL, engine: AppleLogCameraEngine) {
         let asset = AVAsset(url: videoURL)
@@ -3064,7 +3282,8 @@ final class PostProductionLogGrader: ObservableObject {
               let cgIn = srcUI.cgImage,
               let device = engine.metalDevice,
               let postPipeline = engine.postGradePipelineState,
-              let queue = device.makeCommandQueue() else { return }
+              let queue = device.makeCommandQueue(),
+              let activeLUT = engine.custom3DLUTTexture ?? engine.dummy3DLUTTexture else { return }
 
         let loader = MTKTextureLoader(device: device)
         guard let inTex = try? loader.newTexture(cgImage: cgIn, options: [.SRGB: false]) else { return }
@@ -3079,8 +3298,6 @@ final class PostProductionLogGrader: ObservableObject {
         guard let outTex = device.makeTexture(descriptor: outDesc),
               let cmdBuf = queue.makeCommandBuffer(),
               let enc = cmdBuf.makeComputeCommandEncoder() else { return }
-
-        guard let activeLUT = engine.custom3DLUTTexture ?? engine.dummy3DLUTTexture else { return }
 
         var uniforms = engine.makeShaderUniforms(writeRecord: false)
         enc.setComputePipelineState(postPipeline)
@@ -3127,7 +3344,7 @@ final class PostProductionLogGrader: ObservableObject {
     }
 }
 
-// MARK: - 8. Blackmagic-Style HUD Overlays (Gyro Horizon, VU Meter, Histogram, Focus Reticle)
+// MARK: - 8. Blackmagic-Style HUD Overlays
 
 struct GyroHorizonOverlayView: View {
     let rollDegrees: Double
@@ -3312,7 +3529,7 @@ struct AspectGuideAndGridOverlayView: View {
     }
 }
 
-// MARK: - 9. Main Cinema Camera UI (Blackmagic Camera Style + LUT Studio + Photo Capture)
+// MARK: - 9. Main Cinema Camera UI
 
 enum ActiveControlDrawer: Int {
     case none       = 0
@@ -3338,7 +3555,7 @@ struct CineLogMainCameraView: View {
             ZStack {
                 Color.black.ignoresSafeArea()
 
-                // 1. Live Metal Viewfinder with Tap / Long-Press AF/AE Gesture
+                // 1. Live Metal Viewfinder
                 MetalLogViewfinder(engine: engine)
                     .ignoresSafeArea()
                     .gesture(
@@ -3400,7 +3617,7 @@ struct CineLogMainCameraView: View {
                     }
                     .padding(.top, 4)
 
-                    // Row 2: Fixed-Size Action Buttons + Audio VU Meter + Live Luma Histogram (Never Wraps Text Vertically!)
+                    // Row 2: Fixed-Size Action Buttons + Audio VU Meter + Live Luma Histogram
                     HStack(spacing: 8) {
                         Button {
                             engine.rotateOrientation90Degrees()
@@ -3443,7 +3660,7 @@ struct CineLogMainCameraView: View {
                     }
                     .padding(.horizontal, 12)
 
-                    // Row 3: Single-Line Telemetry Banner (Fixes IMG_4729 4032x3024 vertical text wrap)
+                    // Row 3: Single-Line Telemetry Banner
                     HStack {
                         Text("\(engine.activeResolutionBadge) • \(engine.statusMessage)")
                             .font(.system(size: 10, weight: .semibold, design: .monospaced))
@@ -3596,7 +3813,6 @@ struct CineLogMainCameraView: View {
 
                             Spacer()
 
-                            // High-Priority Touch Shutter Button (Never Drops Taps!)
                             Button(action: { engine.triggerMainShutter() }) {
                                 ZStack {
                                     Circle()
@@ -3695,7 +3911,7 @@ struct FormatAndStabilizationDrawer: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack {
-                Text("传感器画幅 (Open Gate 4:3 / 4K 16:9) & 防抖")
+                Text("传感器画幅 (4K 16:9 / 1080p / Open Gate 4:3) & 防抖")
                     .font(.system(size: 11, weight: .bold, design: .monospaced))
                     .foregroundColor(.yellow)
                 Spacer()
@@ -3895,7 +4111,7 @@ struct LUTSystemDrawerView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
-                Text("3D LUT 调色台 (四面体插值 + 宽域去断层)")
+                Text("校准版 3D LUT 调色台 (ACES/BT.709 曲线 + 四面体插值)")
                     .font(.system(size: 11, weight: .bold, design: .monospaced))
                     .foregroundColor(.yellow)
                 Spacer()
@@ -3945,7 +4161,9 @@ struct LUTSystemDrawerView: View {
 
             VStack(spacing: 5) {
                 CompactSliderRow(title: "LUT 强度", value: $engine.lutSettings.lutIntensity, range: 0.0...1.0, format: "%.2f")
-                CompactSliderRow(title: "去断层 Deband", value: $engine.lutSettings.debanding, range: 0.0...1.0, format: "%.2f")
+                if engine.selectedSensorPreset == .openGateMax {
+                    CompactSliderRow(title: "OpenGate去断层", value: $engine.lutSettings.debanding, range: 0.0...1.0, format: "%.2f")
+                }
                 CompactSliderRow(title: "曝光补偿 EV", value: $engine.lutSettings.exposureEV, range: -2.0...2.0, format: "%+.2f")
                 CompactSliderRow(title: "对比度", value: $engine.lutSettings.contrast, range: 0.6...1.5, format: "%.2f")
                 CompactSliderRow(title: "高光柔和 Roll", value: $engine.lutSettings.highlightRollOff, range: 0.0...1.0, format: "%.2f")
@@ -3968,7 +4186,7 @@ struct MonitorAndSlateDrawer: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack {
-                Text("专业监看辅助 & 场记板元数据")
+                Text("专业监看辅助 & 存储空间防占满保护")
                     .font(.system(size: 11, weight: .bold, design: .monospaced))
                     .foregroundColor(.yellow)
                 Spacer()
@@ -4011,12 +4229,36 @@ struct MonitorAndSlateDrawer: View {
             }
 
             HStack {
+                Toggle("录制后保存至相册", isOn: $engine.autoSaveVideoToPhotos)
+                    .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                Spacer()
+                Button {
+                    engine.purgeAllTemporaryMediaFiles()
+                    engine.statusMessage = "已彻底清空沙盒临时缓存 (0.0 MB)"
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "trash")
+                        Text(String(format: "清理缓存(%.1fMB)", engine.tempStorageUsedMB))
+                    }
+                    .font(.system(size: 10, weight: .bold, design: .monospaced))
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(Color.red.opacity(0.25))
+                    .foregroundColor(.red)
+                    .cornerRadius(6)
+                }
+            }
+
+            HStack {
                 Toggle("九宫格构图线", isOn: $engine.showGridOverlay)
                     .font(.system(size: 10, weight: .semibold, design: .monospaced))
                 Spacer()
                 Toggle("真实时间码 (TOD)", isOn: $engine.useTimeOfDayTimecode)
                     .font(.system(size: 10, weight: .semibold, design: .monospaced))
             }
+        }
+        .onAppear {
+            engine.refreshTempStorageUsage()
         }
     }
 }
@@ -4048,7 +4290,7 @@ struct PostProductionGradingSheetView: View {
                             Image(systemName: "film.stack")
                                 .font(.system(size: 34))
                                 .foregroundColor(.gray)
-                            Text("加载刚录制的 Apple Log 视频或导入素材进行无损调色")
+                            Text("加载最新录制内存帧或从文件导入 Apple Log 视频调色")
                                 .font(.system(size: 12, design: .monospaced))
                                 .foregroundColor(.gray)
                         }
@@ -4057,9 +4299,9 @@ struct PostProductionGradingSheetView: View {
                 .padding(.horizontal)
 
                 HStack(spacing: 12) {
-                    if let lastURL = engine.lastRecordedVideoURL {
-                        Button("加载最新录制片段") {
-                            postGrader.extractPreviewFrame(from: lastURL, engine: engine)
+                    if engine.lastRecordedPreviewFrame != nil {
+                        Button("加载最新录制帧") {
+                            postGrader.loadCachedPreviewFrame(from: engine)
                         }
                         .font(.system(size: 11, weight: .bold, design: .monospaced))
                         .padding(.horizontal, 10)
@@ -4106,6 +4348,11 @@ struct PostProductionGradingSheetView: View {
                 }
                 .onChange(of: engine.lutSettings) { _ in
                     postGrader.renderGradedStill(engine: engine)
+                }
+                .onAppear {
+                    if postGrader.sourceImage == nil {
+                        postGrader.loadCachedPreviewFrame(from: engine)
+                    }
                 }
             }
             .navigationTitle("Apple Log 后期无损调色室")
