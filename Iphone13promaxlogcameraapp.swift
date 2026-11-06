@@ -2924,7 +2924,7 @@ final class AppleLogCameraEngine: NSObject, ObservableObject, @unchecked Sendabl
         }
         self.recordBufferPool = nil
         self.currentRecordPoolDims = CMVideoDimensions(width: 0, height: 0)
-        self. _latestRecordTexture = nil
+        self._latestRecordTexture = nil
         if let cache = self.textureCache {
             CVMetalTextureCacheFlush(cache, 0)
         }
