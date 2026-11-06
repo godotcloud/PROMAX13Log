@@ -12,7 +12,7 @@
 //       direct integer .read(gid) on 10-bit 'x422'/'x420' planes -> ycbcr10VideoRangeToBT2020RGB ->
 //       hlgToLinearBT2020 (gain = 2.4) -> linearToAppleLog at native 1:1 resolution.
 //     - ONLY Open Gate 4:3 (4032x3024) activates the 8-bit SDR stochastic debander, SDR-to-BT.2020
-//       inverse OETF, and 2880x2160 (4:3) hardware-safe video encoding dimension adaptation.
+//       inverse OETF, and full-size 4032x3024 (3024x4032 in Portrait) video & photo recording.
 //  2. Mathematically Accurate Built-In Cinema LUTs:
 //     - Restored true ITU-R BT.709 OETF + ACES Narkowicz Filmic Tone Mapping (18% middle gray = 0.42 IRE,
 //       true shadow toe, smooth highlight roll-off) and calibrated 3x3 colorimetric matrices for
@@ -2352,12 +2352,38 @@ final class AppleLogCameraEngine: NSObject, ObservableObject, @unchecked Sendabl
 
     // MARK: - Rock-Solid ProRes & HEVC Recording (With Immediate Temp File Cleanup!)
 
-    /// Only scales dimensions when in Open Gate 4:3 (4032x3024 -> 2880x2160); 4K 16:9 and 1080p 16:9 use exact 1:1 sensor dimensions.
+    /// Always returns the full native sensor dimensions (4032x3024 in Open Gate 4:3, 3840x2160 in 4K 16:9, 1920x1080 in 1080p).
     private func targetVideoDimensions(sensorW: Int, sensorH: Int, preset: SensorFormatPreset) -> (Int, Int) {
-        if preset == .openGateMax && sensorH > 2160 {
-            return (2880, 2160)
-        }
         return ((sensorW / 2) * 2, (sensorH / 2) * 2)
+    }
+
+    /// Probes the hardware VideoToolbox encoder to verify if the selected codec (e.g. ProRes 422) supports full 4032x3024.
+    /// If the A15 ProRes ASIC caps at 2160p height, automatically switches to 80 Mbps Cinema HEVC so full 4032x3024 is preserved!
+    private func canHardwareEncode(width: Int, height: Int, codec: RecordingCodecOption) -> Bool {
+        let cmCodec: CMVideoCodecType
+        switch codec {
+        case .proRes422HQ: cmCodec = kCMVideoCodecType_AppleProRes422HQ
+        case .proRes422:   cmCodec = kCMVideoCodecType_AppleProRes422
+        case .proRes422LT: cmCodec = kCMVideoCodecType_AppleProRes422LT
+        case .hevc10Bit:   cmCodec = kCMVideoCodecType_HEVC
+        }
+        var session: VTCompressionSession?
+        let status = VTCompressionSessionCreate(
+            allocator: kCFAllocatorDefault,
+            width: Int32(width),
+            height: Int32(height),
+            codecType: cmCodec,
+            encoderSpecification: nil,
+            imageBufferAttributes: nil,
+            compressedDataAllocator: nil,
+            outputCallback: nil,
+            refcon: nil,
+            compressionSessionOut: &session
+        )
+        guard status == noErr, let validSession = session else { return false }
+        let prepStatus = VTCompressionSessionPrepareToEncodeFrames(validSession)
+        VTCompressionSessionInvalidate(validSession)
+        return prepStatus == noErr
     }
 
     func triggerMainShutter() {
@@ -2409,12 +2435,16 @@ final class AppleLogCameraEngine: NSObject, ObservableObject, @unchecked Sendabl
             let sW = Int(self.activeSensorDims.width > 0 ? self.activeSensorDims.width : 3840)
             let sH = Int(self.activeSensorDims.height > 0 ? self.activeSensorDims.height : 2160)
 
+            let (width, height) = self.targetVideoDimensions(sensorW: sW, sensorH: sH, preset: self.selectedSensorPreset)
+
             var chosenCodec = self.selectedCodec
-            if self.selectedFPS == .fps60 && chosenCodec.isProRes && sW > 1920 {
+            if self.selectedFPS == .fps60 && chosenCodec.isProRes && width > 1920 {
                 chosenCodec = .hevc10Bit
             }
-
-            let (width, height) = self.targetVideoDimensions(sensorW: sW, sensorH: sH, preset: self.selectedSensorPreset)
+            // If full 4032x3024 Open Gate exceeds A15 ProRes ASIC height limit (2160p), use 80 Mbps Cinema HEVC to keep full 4032x3024!
+            if chosenCodec.isProRes && !self.canHardwareEncode(width: width, height: height, codec: chosenCodec) {
+                chosenCodec = .hevc10Bit
+            }
 
             // Hardware HEVC encoder (AppleAVE2) on A15 Bionic works 100% natively with kCVPixelFormatType_32BGRA (.bgra8Unorm),
             // whereas AppleProResHW supports kCVPixelFormatType_64RGBAHalf (.rgba16Float).
@@ -2441,7 +2471,7 @@ final class AppleLogCameraEngine: NSObject, ObservableObject, @unchecked Sendabl
                 var videoSettings: [String: Any]
                 if chosenCodec == .hevc10Bit {
                     // Clean hardware-compatible HEVC settings for AppleAVE2 (no conflicting Main10 YCbCr attachment requirement)
-                    let targetBitrate = (width * height > 2_500_000) ? 55_000_000 : 22_000_000
+                    let targetBitrate = (width * height > 9_000_000) ? 75_000_000 : ((width * height > 2_500_000) ? 55_000_000 : 22_000_000)
                     videoSettings = [
                         AVVideoCodecKey: AVVideoCodecType.hevc.rawValue,
                         AVVideoWidthKey: width,
@@ -2872,7 +2902,7 @@ extension AppleLogCameraEngine: AVCaptureVideoDataOutputSampleBufferDelegate, AV
         let needRecordOut = recActive || isPhotoSnap
 
         // Standard modes (4K 16:9 and 1080p 16:9) use their exact native sensor resolution (3840x2160 / 1920x1080).
-        // ONLY Open Gate 4:3 (4032x3024) scales to 2880x2160 during video recording (or 2016x1512 during idle preview).
+        // Open Gate 4:3 (4032x3024) records and captures photos at full 4032x3024 (3024x4032 in Portrait), using 2016x1512 only during idle framing.
         let computeW: Int
         let computeH: Int
         if selectedSensorPreset == .openGateMax {
@@ -3021,6 +3051,9 @@ extension AppleLogCameraEngine: AVCaptureVideoDataOutputSampleBufferDelegate, AV
         recordingStateLock.unlock()
 
         guard canAppend, let writer = assetWriter else { return }
+        let pbW = Int32(CVPixelBufferGetWidth(pixelBuffer))
+        let pbH = Int32(CVPixelBufferGetHeight(pixelBuffer))
+        guard pbW == currentRecordPoolDims.width && pbH == currentRecordPoolDims.height else { return }
 
         if writer.status == .failed {
             let errMsg = writer.error?.localizedDescription ?? "编码器写入异常"
