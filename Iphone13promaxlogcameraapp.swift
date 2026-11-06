@@ -794,9 +794,9 @@ enum LUTInputSpaceOption: Int, CaseIterable, Identifiable {
 
     var title: String {
         switch self {
-        case .appleLogBT2020: return "iPhone 15 Log (BT.2020)"
-        case .appleLogRec709: return "Apple Log (709色域适配)"
-        case .rec709Display:  return "Rec.709 标准输入"
+        case .appleLogBT2020: return "iPhone15 Log"
+        case .appleLogRec709: return "Log(709适配)"
+        case .rec709Display:  return "Rec.709标准"
         }
     }
 }
@@ -3715,7 +3715,7 @@ struct StereoAudioVUMeterView: View {
             }
             .frame(height: 5)
         }
-        .frame(width: 74, height: 16)
+        .frame(width: 56, height: 16)
         .padding(.horizontal, 6)
         .padding(.vertical, 4)
         .background(Color.black.opacity(0.65))
@@ -3733,10 +3733,10 @@ struct LumaHistogramOverlay: View {
             ForEach(0..<bins.count, id: \.self) { idx in
                 Rectangle()
                     .fill(barColor(for: idx))
-                    .frame(width: 1.7, height: max(2, CGFloat(bins[idx]) * 20))
+                    .frame(width: 1.15, height: max(2, CGFloat(bins[idx]) * 18))
             }
         }
-        .frame(width: 130, height: 22)
+        .frame(width: 96, height: 20)
         .padding(4)
         .background(Color.black.opacity(0.65))
         .cornerRadius(6)
@@ -3821,7 +3821,7 @@ struct AspectGuideAndGridOverlayView: View {
     }
 }
 
-// MARK: - 9. Adaptive Landscape & Portrait Cinema Camera UI (Never Pushes Controls Off-Screen!)
+// MARK: - 9. Symmetrical & Width-Locked Adaptive Cinema Camera UI (Portrait & Landscape)
 
 enum ActiveControlDrawer: Int {
     case none       = 0
@@ -3844,13 +3844,17 @@ struct CineLogMainCameraView: View {
 
     var body: some View {
         GeometryReader { geo in
-            let isLandscape = geo.size.width > geo.size.height
+            let screenW = geo.size.width
+            let screenH = geo.size.height
+            let isLandscape = screenW > screenH
+            let cardWidth = max(280, screenW - 20)
 
-            ZStack {
+            ZStack(alignment: .center) {
                 Color.black.ignoresSafeArea()
 
-                // 1. Live Metal Viewfinder (Tap outside drawer closes open drawer or focuses!)
+                // 1. Live Metal Viewfinder
                 MetalLogViewfinder(engine: engine)
+                    .frame(width: screenW, height: screenH)
                     .ignoresSafeArea()
                     .gesture(
                         DragGesture(minimumDistance: 0)
@@ -3861,8 +3865,8 @@ struct CineLogMainCameraView: View {
                                     }
                                     return
                                 }
-                                let normX = max(0.05, min(0.95, value.location.x / max(1, geo.size.width)))
-                                let normY = max(0.05, min(0.95, value.location.y / max(1, geo.size.height)))
+                                let normX = max(0.05, min(0.95, value.location.x / max(1, screenW)))
+                                let normY = max(0.05, min(0.95, value.location.y / max(1, screenH)))
                                 engine.handleViewfinderTap(normalizedPoint: CGPoint(x: normX, y: normY), lockFocusAndExposure: false)
                             }
                     )
@@ -3882,6 +3886,7 @@ struct CineLogMainCameraView: View {
                     focusReticle: engine.focusReticleNormalized,
                     isLocked: engine.isFocusLockedByTap
                 )
+                .frame(width: screenW, height: screenH)
                 .ignoresSafeArea()
 
                 // 3. Gyro Horizon Leveler
@@ -3900,10 +3905,10 @@ struct CineLogMainCameraView: View {
                         .allowsHitTesting(false)
                 }
 
-                // 5. Adaptive Cinema HUD (Compact Merged Bars in Landscape so Zero Controls Overflow!)
-                VStack(spacing: isLandscape ? 3 : 6) {
+                // 5. Width-Locked HUD Container (Strictly Clamped to screenW so Zero Horizontal Drift Occurs!)
+                VStack(spacing: isLandscape ? 3 : 5) {
                     if isLandscape {
-                        // === LANDSCAPE COMPACT TOP BAR (Single 36pt Row) ===
+                        // === LANDSCAPE COMPACT TOP BAR ===
                         HStack(spacing: 6) {
                             Button {
                                 engine.rotateOrientation90Degrees()
@@ -3913,7 +3918,7 @@ struct CineLogMainCameraView: View {
                                     Text(engine.orientationMode.shortLabel)
                                 }
                                 .font(.system(size: 10, weight: .bold, design: .monospaced))
-                                .padding(.horizontal, 7)
+                                .padding(.horizontal, 6)
                                 .padding(.vertical, 4)
                                 .background(Color.black.opacity(0.70))
                                 .foregroundColor(.yellow)
@@ -3927,10 +3932,10 @@ struct CineLogMainCameraView: View {
                             } label: {
                                 HStack(spacing: 3) {
                                     Image(systemName: "slider.horizontal.below.rectangle")
-                                    Text("后期调色")
+                                    Text("调色室")
                                 }
                                 .font(.system(size: 10, weight: .bold, design: .monospaced))
-                                .padding(.horizontal, 7)
+                                .padding(.horizontal, 6)
                                 .padding(.vertical, 4)
                                 .background(Color.cyan.opacity(0.25))
                                 .foregroundColor(.cyan)
@@ -3944,10 +3949,10 @@ struct CineLogMainCameraView: View {
                             } label: {
                                 HStack(spacing: 3) {
                                     Image(systemName: "bolt.shield.fill")
-                                    Text("释放缓存")
+                                    Text("清缓存")
                                 }
                                 .font(.system(size: 10, weight: .bold, design: .monospaced))
-                                .padding(.horizontal, 7)
+                                .padding(.horizontal, 6)
                                 .padding(.vertical, 4)
                                 .background(Color.orange.opacity(0.25))
                                 .foregroundColor(.orange)
@@ -3973,11 +3978,12 @@ struct CineLogMainCameraView: View {
                         }
                         .padding(.horizontal, 10)
                         .padding(.top, 4)
+                        .frame(width: screenW)
                         .layoutPriority(10)
                     } else {
-                        // === PORTRAIT TOP HUD ===
+                        // === PORTRAIT TOP HUD (Strictly Width-Clamped to screenW!) ===
                         ScrollView(.horizontal, showsIndicators: false) {
-                            HStack(spacing: 6) {
+                            HStack(spacing: 5) {
                                 TelemetryPill(label: "RES", value: engine.selectedSensorPreset.shortBadge, highlight: true)
                                 TelemetryPill(label: "FPS", value: "\(Int(engine.selectedFPS.rawValue))", highlight: false)
                                 TelemetryPill(label: "SHUTTER", value: "\(Int(engine.shutterAngleDegrees))°", highlight: engine.isManualExposure)
@@ -3986,22 +3992,24 @@ struct CineLogMainCameraView: View {
                                 TelemetryPill(label: "FOCUS", value: "\(engine.focusMode.shortTitle) \(String(format: "%.2f", engine.lensPosition))", highlight: engine.focusMode == .manualFocus)
                                 TelemetryPill(label: "STAB", value: engine.stabilizationMode.shortTitle, highlight: engine.stabilizationMode != .off)
                             }
-                            .padding(.horizontal, 12)
+                            .padding(.horizontal, 10)
                         }
+                        .frame(width: screenW)
                         .padding(.top, 4)
 
-                        HStack(spacing: 8) {
+                        // Row 2: Compact Action Pills + VU Meter + Histogram (Total width ~350pt < 390/428pt)
+                        HStack(spacing: 5) {
                             Button {
                                 engine.rotateOrientation90Degrees()
                             } label: {
-                                HStack(spacing: 4) {
+                                HStack(spacing: 3) {
                                     Image(systemName: engine.orientationMode.isPortraitSwapped ? "rectangle.portrait" : "rectangle")
                                     Text(engine.orientationMode.shortLabel)
                                 }
-                                .font(.system(size: 11, weight: .bold, design: .monospaced))
-                                .padding(.horizontal, 8)
+                                .font(.system(size: 10, weight: .bold, design: .monospaced))
+                                .padding(.horizontal, 7)
                                 .padding(.vertical, 5)
-                                .background(Color.black.opacity(0.65))
+                                .background(Color.black.opacity(0.68))
                                 .foregroundColor(.yellow)
                                 .cornerRadius(6)
                                 .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.yellow.opacity(0.5), lineWidth: 1))
@@ -4011,12 +4019,12 @@ struct CineLogMainCameraView: View {
                             Button {
                                 showPostGradingSheet = true
                             } label: {
-                                HStack(spacing: 4) {
+                                HStack(spacing: 3) {
                                     Image(systemName: "slider.horizontal.below.rectangle")
-                                    Text("后期调色")
+                                    Text("调色室")
                                 }
-                                .font(.system(size: 11, weight: .bold, design: .monospaced))
-                                .padding(.horizontal, 8)
+                                .font(.system(size: 10, weight: .bold, design: .monospaced))
+                                .padding(.horizontal, 7)
                                 .padding(.vertical, 5)
                                 .background(Color.cyan.opacity(0.25))
                                 .foregroundColor(.cyan)
@@ -4030,10 +4038,10 @@ struct CineLogMainCameraView: View {
                             } label: {
                                 HStack(spacing: 3) {
                                     Image(systemName: "bolt.shield.fill")
-                                    Text("释放缓存")
+                                    Text("清缓存")
                                 }
-                                .font(.system(size: 11, weight: .bold, design: .monospaced))
-                                .padding(.horizontal, 8)
+                                .font(.system(size: 10, weight: .bold, design: .monospaced))
+                                .padding(.horizontal, 7)
                                 .padding(.vertical, 5)
                                 .background(Color.orange.opacity(0.25))
                                 .foregroundColor(.orange)
@@ -4047,35 +4055,39 @@ struct CineLogMainCameraView: View {
                             StereoAudioVUMeterView(leftDB: engine.audioPeakDBLeft, rightDB: engine.audioPeakDBRight)
                             LumaHistogramOverlay(bins: engine.lumaHistogram)
                         }
-                        .padding(.horizontal, 12)
+                        .padding(.horizontal, 10)
+                        .frame(width: screenW)
 
+                        // Row 3: Status Banner
                         HStack {
                             Text("\(engine.activeResolutionBadge) • \(engine.statusMessage)")
                                 .font(.system(size: 10, weight: .semibold, design: .monospaced))
                                 .foregroundColor(.white)
                                 .lineLimit(1)
+                                .truncationMode(.tail)
                                 .padding(.horizontal, 8)
                                 .padding(.vertical, 3)
-                                .background(Color.black.opacity(0.60))
+                                .background(Color.black.opacity(0.62))
                                 .cornerRadius(4)
-                            Spacer()
+                            Spacer(minLength: 0)
                         }
-                        .padding(.horizontal, 12)
+                        .padding(.horizontal, 10)
+                        .frame(width: screenW)
                     }
 
                     Spacer(minLength: 2)
 
-                    // Floating Lens Bar in Portrait (In Landscape, Lens Buttons are integrated into the Bottom Dock to save height!)
+                    // Centered Floating Lens Bar in Portrait
                     if !isLandscape {
-                        HStack(spacing: 10) {
+                        HStack(spacing: 9) {
                             ForEach(CameraLensOption.allCases) { lens in
                                 Button {
                                     engine.selectedLens = lens
                                 } label: {
                                     Text(lens.rawValue)
                                         .font(.system(size: 12, weight: .bold, design: .monospaced))
-                                        .frame(width: 38, height: 38)
-                                        .background(engine.selectedLens == lens ? Color.yellow : Color.black.opacity(0.65))
+                                        .frame(width: 36, height: 36)
+                                        .background(engine.selectedLens == lens ? Color.yellow : Color.black.opacity(0.68))
                                         .foregroundColor(engine.selectedLens == lens ? .black : .white)
                                         .clipShape(Circle())
                                         .overlay(Circle().stroke(Color.white.opacity(0.25), lineWidth: 1))
@@ -4088,11 +4100,11 @@ struct CineLogMainCameraView: View {
                                 Text("PEAK")
                                     .font(.system(size: 10, weight: .bold, design: .monospaced))
                                     .padding(.horizontal, 10)
-                                    .frame(height: 38)
-                                    .background(engine.focusPeakingEnabled ? Color.green : Color.black.opacity(0.65))
+                                    .frame(height: 36)
+                                    .background(engine.focusPeakingEnabled ? Color.green : Color.black.opacity(0.68))
                                     .foregroundColor(engine.focusPeakingEnabled ? .black : .white)
-                                    .cornerRadius(19)
-                                    .overlay(RoundedRectangle(cornerRadius: 19).stroke(Color.white.opacity(0.25), lineWidth: 1))
+                                    .cornerRadius(18)
+                                    .overlay(RoundedRectangle(cornerRadius: 18).stroke(Color.white.opacity(0.25), lineWidth: 1))
                             }
 
                             Button {
@@ -4100,29 +4112,30 @@ struct CineLogMainCameraView: View {
                             } label: {
                                 HStack(spacing: 4) {
                                     Image(systemName: "camera.fill")
-                                    Text("抓拍照片")
+                                    Text("抓拍")
                                 }
                                 .font(.system(size: 10, weight: .bold, design: .monospaced))
                                 .padding(.horizontal, 12)
-                                .frame(height: 38)
-                                .background(Color.white.opacity(0.90))
+                                .frame(height: 36)
+                                .background(Color.white.opacity(0.92))
                                 .foregroundColor(.black)
-                                .cornerRadius(19)
-                                .overlay(RoundedRectangle(cornerRadius: 19).stroke(Color.yellow, lineWidth: 1))
+                                .cornerRadius(18)
+                                .overlay(RoundedRectangle(cornerRadius: 18).stroke(Color.yellow, lineWidth: 1))
                             }
                         }
+                        .frame(width: screenW, alignment: .center)
                         .padding(.bottom, 2)
                     }
 
-                    // Height-Capped Scrollable Control Drawer with Explicit "✕ 收起" Button
+                    // Width-Clamped & Height-Capped Scrollable Control Drawer Card
                     if activeTab != .none {
                         VStack(spacing: 6) {
-                            HStack {
-                                Text("\(engine.activeResolutionBadge) • \(engine.statusMessage)")
-                                    .font(.system(size: 9, weight: .semibold, design: .monospaced))
-                                    .foregroundColor(.gray)
+                            HStack(spacing: 6) {
+                                Text(drawerTitle(for: activeTab))
+                                    .font(.system(size: 10.5, weight: .bold, design: .monospaced))
+                                    .foregroundColor(.yellow)
                                     .lineLimit(1)
-                                Spacer()
+                                Spacer(minLength: 4)
                                 Button {
                                     withAnimation(.easeInOut(duration: 0.18)) {
                                         activeTab = .none
@@ -4130,7 +4143,7 @@ struct CineLogMainCameraView: View {
                                 } label: {
                                     HStack(spacing: 3) {
                                         Image(systemName: "xmark.circle.fill")
-                                        Text("收起面板")
+                                        Text("收起")
                                     }
                                     .font(.system(size: 10, weight: .bold, design: .monospaced))
                                     .padding(.horizontal, 8)
@@ -4139,6 +4152,7 @@ struct CineLogMainCameraView: View {
                                     .foregroundColor(.yellow)
                                     .cornerRadius(6)
                                 }
+                                .fixedSize()
                             }
 
                             ScrollView(.vertical, showsIndicators: true) {
@@ -4163,23 +4177,21 @@ struct CineLogMainCameraView: View {
                                         )
                                     }
                                 }
-                                .padding(.trailing, 4)
+                                .frame(maxWidth: .infinity)
                             }
-                            .frame(maxHeight: isLandscape ? min(185, max(120, geo.size.height - 145)) : min(285, geo.size.height * 0.40))
+                            .frame(maxHeight: isLandscape ? min(180, max(115, screenH - 145)) : min(270, screenH * 0.38))
                         }
                         .padding(10)
+                        .frame(width: cardWidth)
                         .background(Color.black.opacity(0.90))
                         .cornerRadius(12)
                         .overlay(RoundedRectangle(cornerRadius: 12).stroke(Color.white.opacity(0.20), lineWidth: 1))
-                        .padding(.horizontal, 12)
                         .transition(.move(edge: .bottom).combined(with: .opacity))
                     }
 
-                    // === LOCKED BOTTOM CONTROL DOCK (Never Pushed Off-Screen!) ===
+                    // === SYMMETRICAL & WIDTH-LOCKED BOTTOM CONTROL DOCK ===
                     if isLandscape {
-                        // Single-Row Landscape Cinema Dock: Lens Pills + 5 Drawer Tabs + Mode Switcher + Timecode + Main Shutter + Snap
                         HStack(spacing: 8) {
-                            // Lens Pills + Peak
                             HStack(spacing: 4) {
                                 ForEach(CameraLensOption.allCases) { lens in
                                     Button {
@@ -4207,28 +4219,24 @@ struct CineLogMainCameraView: View {
                             }
                             .fixedSize()
 
-                            // 5 Drawer Tabs
-                            ScrollView(.horizontal, showsIndicators: false) {
-                                HStack(spacing: 5) {
-                                    DrawerTabButton(title: "画幅/防抖", icon: "gyroscope", isActive: activeTab == .format) {
-                                        toggleTab(.format)
-                                    }
-                                    DrawerTabButton(title: "对焦/跟焦", icon: "viewfinder", isActive: activeTab == .focus) {
-                                        toggleTab(.focus)
-                                    }
-                                    DrawerTabButton(title: "曝光/色温", icon: "camera.aperture", isActive: activeTab == .exposure) {
-                                        toggleTab(.exposure)
-                                    }
-                                    DrawerTabButton(title: "实时调色", icon: "cube", isActive: activeTab == .lutGrading) {
-                                        toggleTab(.lutGrading)
-                                    }
-                                    DrawerTabButton(title: "辅助/场记", icon: "waveform", isActive: activeTab == .monitor) {
-                                        toggleTab(.monitor)
-                                    }
+                            HStack(spacing: 4) {
+                                EqualWidthDrawerTabButton(title: "画幅", icon: "gyroscope", isActive: activeTab == .format) {
+                                    toggleTab(.format)
+                                }
+                                EqualWidthDrawerTabButton(title: "对焦", icon: "viewfinder", isActive: activeTab == .focus) {
+                                    toggleTab(.focus)
+                                }
+                                EqualWidthDrawerTabButton(title: "曝光", icon: "camera.aperture", isActive: activeTab == .exposure) {
+                                    toggleTab(.exposure)
+                                }
+                                EqualWidthDrawerTabButton(title: "调色", icon: "cube", isActive: activeTab == .lutGrading) {
+                                    toggleTab(.lutGrading)
+                                }
+                                EqualWidthDrawerTabButton(title: "监看", icon: "waveform", isActive: activeTab == .monitor) {
+                                    toggleTab(.monitor)
                                 }
                             }
 
-                            // Video / Photo Switcher + Timecode
                             VStack(alignment: .trailing, spacing: 2) {
                                 HStack(spacing: 4) {
                                     ForEach(CaptureModeOption.allCases) { mode in
@@ -4251,7 +4259,6 @@ struct CineLogMainCameraView: View {
                             }
                             .fixedSize()
 
-                            // Quick Still Snap Button
                             Button {
                                 engine.captureStillPhoto()
                             } label: {
@@ -4264,16 +4271,15 @@ struct CineLogMainCameraView: View {
                             }
                             .fixedSize()
 
-                            // Main Record / Shutter Button
                             Button(action: { engine.triggerMainShutter() }) {
                                 ZStack {
                                     Circle()
                                         .stroke(Color.white, lineWidth: 2.5)
-                                        .frame(width: 48, height: 48)
+                                        .frame(width: 46, height: 46)
                                     if engine.captureMode == .photo {
                                         Circle()
                                             .fill(Color.white)
-                                            .frame(width: 38, height: 38)
+                                            .frame(width: 36, height: 36)
                                             .overlay(
                                                 Image(systemName: "camera.aperture")
                                                     .font(.system(size: 16, weight: .bold))
@@ -4282,11 +4288,11 @@ struct CineLogMainCameraView: View {
                                     } else if engine.isRecording {
                                         RoundedRectangle(cornerRadius: 6)
                                             .fill(Color.red)
-                                            .frame(width: 22, height: 22)
+                                            .frame(width: 20, height: 20)
                                     } else {
                                         Circle()
                                             .fill(Color.red)
-                                            .frame(width: 38, height: 38)
+                                            .frame(width: 36, height: 36)
                                     }
                                 }
                                 .contentShape(Circle())
@@ -4294,117 +4300,139 @@ struct CineLogMainCameraView: View {
                             .buttonStyle(.plain)
                             .fixedSize()
                         }
-                        .padding(.horizontal, 12)
+                        .padding(.horizontal, 10)
                         .padding(.vertical, 6)
+                        .frame(width: screenW)
                         .background(Color.black.opacity(0.86))
                         .layoutPriority(10)
                     } else {
-                        // Portrait Bottom Control Dock
-                        VStack(spacing: 6) {
-                            HStack(spacing: 6) {
-                                DrawerTabButton(title: "画幅/防抖", icon: "gyroscope", isActive: activeTab == .format) {
+                        // === PORTRAIT BOTTOM DOCK (100% Centered & Equal-Width 5-Tab Grid) ===
+                        VStack(spacing: 7) {
+                            // 5 Equal-Width Tabs (Never Clips or Overflows!)
+                            HStack(spacing: 5) {
+                                EqualWidthDrawerTabButton(title: "画幅/防抖", icon: "gyroscope", isActive: activeTab == .format) {
                                     toggleTab(.format)
                                 }
-                                DrawerTabButton(title: "对焦/跟焦", icon: "viewfinder", isActive: activeTab == .focus) {
+                                EqualWidthDrawerTabButton(title: "对焦/跟焦", icon: "viewfinder", isActive: activeTab == .focus) {
                                     toggleTab(.focus)
                                 }
-                                DrawerTabButton(title: "曝光/色温", icon: "camera.aperture", isActive: activeTab == .exposure) {
+                                EqualWidthDrawerTabButton(title: "曝光/色温", icon: "camera.aperture", isActive: activeTab == .exposure) {
                                     toggleTab(.exposure)
                                 }
-                                DrawerTabButton(title: "实时调色", icon: "cube", isActive: activeTab == .lutGrading) {
+                                EqualWidthDrawerTabButton(title: "实时调色", icon: "cube", isActive: activeTab == .lutGrading) {
                                     toggleTab(.lutGrading)
                                 }
-                                DrawerTabButton(title: "辅助/场记", icon: "waveform", isActive: activeTab == .monitor) {
+                                EqualWidthDrawerTabButton(title: "监看/缓存", icon: "waveform", isActive: activeTab == .monitor) {
                                     toggleTab(.monitor)
                                 }
                             }
                             .padding(.horizontal, 10)
+                            .frame(width: screenW)
 
-                            HStack(spacing: 18) {
+                            // Centered Mode Switcher + Compact Dual-Save Pill (No Bulky UISwitch!)
+                            HStack(spacing: 10) {
                                 ForEach(CaptureModeOption.allCases) { mode in
                                     Button {
                                         engine.captureMode = mode
                                     } label: {
                                         Text(mode.title)
-                                            .font(.system(size: 11, weight: .bold, design: .monospaced))
+                                            .font(.system(size: 10.5, weight: .bold, design: .monospaced))
                                             .padding(.horizontal, 10)
-                                            .padding(.vertical, 3)
-                                            .background(engine.captureMode == mode ? Color.yellow.opacity(0.22) : Color.clear)
+                                            .padding(.vertical, 4)
+                                            .background(engine.captureMode == mode ? Color.yellow.opacity(0.24) : Color.white.opacity(0.06))
                                             .foregroundColor(engine.captureMode == mode ? .yellow : .gray)
                                             .cornerRadius(6)
                                     }
                                 }
 
                                 if engine.captureMode == .photo {
-                                    Toggle("双存Log原片+LUT", isOn: $engine.dualSaveRawAndGradedPhoto)
+                                    Button {
+                                        engine.dualSaveRawAndGradedPhoto.toggle()
+                                    } label: {
+                                        HStack(spacing: 3) {
+                                            Image(systemName: engine.dualSaveRawAndGradedPhoto ? "checkmark.circle.fill" : "circle")
+                                            Text("双存原片+LUT")
+                                        }
                                         .font(.system(size: 10, weight: .bold, design: .monospaced))
-                                        .foregroundColor(.cyan)
-                                        .fixedSize()
+                                        .padding(.horizontal, 8)
+                                        .padding(.vertical, 4)
+                                        .background(engine.dualSaveRawAndGradedPhoto ? Color.cyan.opacity(0.25) : Color.white.opacity(0.08))
+                                        .foregroundColor(engine.dualSaveRawAndGradedPhoto ? .cyan : .gray)
+                                        .cornerRadius(6)
+                                        .overlay(RoundedRectangle(cornerRadius: 6).stroke(engine.dualSaveRawAndGradedPhoto ? Color.cyan.opacity(0.6) : Color.clear, lineWidth: 1))
+                                    }
                                 }
                             }
+                            .frame(width: screenW, alignment: .center)
 
-                            HStack {
+                            // Symmetrical 3-Column Shutter Bar (Left & Right have equal maxWidth: .infinity so Shutter is at exact 50% center!)
+                            HStack(spacing: 0) {
                                 VStack(alignment: .leading, spacing: 2) {
                                     Text(formatTimecode(engine.recordingDuration, fps: engine.selectedFPS.rawValue))
-                                        .font(.system(size: 16, weight: .bold, design: .monospaced))
+                                        .font(.system(size: 15, weight: .bold, design: .monospaced))
                                         .foregroundColor(engine.isRecording ? .red : .white)
+                                        .lineLimit(1)
                                     Text("\(engine.projectReelName)_T\(String(format: "%02d", engine.clipTakeNumber)) • \(engine.selectedCodec.rawValue)")
-                                        .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                                        .font(.system(size: 9.5, weight: .semibold, design: .monospaced))
                                         .foregroundColor(.yellow)
+                                        .lineLimit(1)
                                 }
-                                .frame(width: 142, alignment: .leading)
-
-                                Spacer()
+                                .frame(maxWidth: .infinity, alignment: .leading)
 
                                 Button(action: { engine.triggerMainShutter() }) {
                                     ZStack {
                                         Circle()
                                             .stroke(Color.white, lineWidth: 3)
-                                            .frame(width: 66, height: 66)
+                                            .frame(width: 64, height: 64)
                                         if engine.captureMode == .photo {
                                             Circle()
                                                 .fill(Color.white)
-                                                .frame(width: 52, height: 52)
+                                                .frame(width: 50, height: 50)
                                                 .overlay(
                                                     Image(systemName: "camera.aperture")
-                                                        .font(.system(size: 22, weight: .bold))
+                                                        .font(.system(size: 21, weight: .bold))
                                                         .foregroundColor(.black)
                                                 )
                                         } else if engine.isRecording {
                                             RoundedRectangle(cornerRadius: 8)
                                                 .fill(Color.red)
-                                                .frame(width: 28, height: 28)
+                                                .frame(width: 26, height: 26)
                                         } else {
                                             Circle()
                                                 .fill(Color.red)
-                                                .frame(width: 52, height: 52)
+                                                .frame(width: 50, height: 50)
                                         }
                                     }
                                     .contentShape(Circle())
                                 }
                                 .buttonStyle(.plain)
-
-                                Spacer()
+                                .frame(width: 72)
 
                                 VStack(alignment: .trailing, spacing: 2) {
-                                    Text(engine.bakeIntoRecording ? "REC: LUT 直出" : "REC: 纯净 APPLE LOG")
+                                    Text(engine.bakeIntoRecording ? "REC: LUT直出" : "REC: 纯净LOG")
                                         .font(.system(size: 10, weight: .bold, design: .monospaced))
                                         .foregroundColor(engine.bakeIntoRecording ? .orange : .green)
-                                    Text("防抖: \(engine.stabilizationMode.shortTitle) • \(engine.orientationMode.shortLabel)")
-                                        .font(.system(size: 10, weight: .medium, design: .monospaced))
+                                        .lineLimit(1)
+                                    Text("防抖:\(engine.stabilizationMode.shortTitle) • \(engine.orientationMode.shortLabel)")
+                                        .font(.system(size: 9.5, weight: .medium, design: .monospaced))
                                         .foregroundColor(.cyan)
+                                        .lineLimit(1)
                                 }
-                                .frame(width: 142, alignment: .trailing)
+                                .frame(maxWidth: .infinity, alignment: .trailing)
                             }
-                            .padding(.horizontal, 16)
+                            .padding(.horizontal, 14)
                             .padding(.bottom, 6)
+                            .frame(width: screenW)
                         }
                         .padding(.top, 8)
-                        .background(Color.black.opacity(0.84))
+                        .frame(width: screenW)
+                        .background(Color.black.opacity(0.85))
                         .layoutPriority(10)
                     }
                 }
+                .frame(width: screenW, height: screenH)
             }
+            .frame(width: screenW, height: screenH)
         }
         .preferredColorScheme(.dark)
         .onAppear {
@@ -4429,6 +4457,17 @@ struct CineLogMainCameraView: View {
         }
     }
 
+    private func drawerTitle(for tab: ActiveControlDrawer) -> String {
+        switch tab {
+        case .none:       return ""
+        case .format:     return "画幅 (4K / 1080p / Open Gate 4:3) & 防抖"
+        case .focus:      return "专业对焦 (MF / A↔B 自动跟焦 / 峰值)"
+        case .exposure:   return "手动曝光 (快门角度 / ISO) & 色温锁定"
+        case .lutGrading: return "3D LUT 调色台 (支持永久驻留 .cube)"
+        case .monitor:    return "监看辅助 • 场记板 • 深度释放缓存"
+        }
+    }
+
     private func toggleTab(_ tab: ActiveControlDrawer) {
         withAnimation(.easeInOut(duration: 0.18)) {
             activeTab = (activeTab == tab) ? .none : tab
@@ -4448,23 +4487,13 @@ struct CineLogMainCameraView: View {
     }
 }
 
-// MARK: - 10. Modular Control Drawers (With 2-Column Landscape Sliders & Resident LUT Bar)
+// MARK: - 10. Modular Control Drawers (Compact, Symmetrical & Never Overflowing)
 
 struct FormatAndStabilizationDrawer: View {
     @ObservedObject var engine: AppleLogCameraEngine
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                Text("传感器画幅 (4K 16:9 / 1080p / Open Gate 4:3) & 防抖")
-                    .font(.system(size: 11, weight: .bold, design: .monospaced))
-                    .foregroundColor(.yellow)
-                Spacer()
-                Toggle("重力自动旋转", isOn: $engine.autoFollowDeviceOrientation)
-                    .font(.system(size: 10, weight: .semibold, design: .monospaced))
-                    .fixedSize()
-            }
-
             Picker("Sensor Format", selection: $engine.selectedSensorPreset) {
                 ForEach(SensorFormatPreset.allCases) { preset in
                     Text(preset.shortBadge).tag(preset)
@@ -4480,7 +4509,7 @@ struct FormatAndStabilizationDrawer: View {
             }
             .pickerStyle(.segmented)
 
-            HStack(spacing: 8) {
+            HStack(spacing: 6) {
                 Picker("FPS", selection: $engine.selectedFPS) {
                     ForEach(FrameRateOption.allCases) { fps in
                         Text(fps.label).tag(fps)
@@ -4498,12 +4527,11 @@ struct FormatAndStabilizationDrawer: View {
                 .disabled(engine.isRecording)
             }
 
-            HStack {
-                Toggle("陀螺仪水平仪", isOn: $engine.showHorizonLeveler)
-                    .font(.system(size: 10, weight: .semibold, design: .monospaced))
-                Spacer()
-                Toggle("水平镜像", isOn: $engine.isMirroredHorizontal)
-                    .font(.system(size: 10, weight: .semibold, design: .monospaced))
+            HStack(spacing: 10) {
+                CompactTogglePill(title: "重力旋转", isOn: $engine.autoFollowDeviceOrientation, activeColor: .yellow)
+                CompactTogglePill(title: "电子水平仪", isOn: $engine.showHorizonLeveler, activeColor: .green)
+                CompactTogglePill(title: "水平镜像", isOn: $engine.isMirroredHorizontal, activeColor: .cyan)
+                Spacer(minLength: 0)
             }
         }
     }
@@ -4514,20 +4542,10 @@ struct FocusAndZoomDrawer: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                Text("专业对焦控制 (MF 手动对焦 / A↔B 自动跟焦 / 峰值对焦)")
-                    .font(.system(size: 11, weight: .bold, design: .monospaced))
-                    .foregroundColor(.yellow)
-                Spacer()
-                Toggle("平滑演播室 AF", isOn: $engine.isSmoothAFEnabled)
-                    .font(.system(size: 10, weight: .semibold, design: .monospaced))
-                    .fixedSize()
-            }
-
-            HStack(spacing: 8) {
+            HStack(spacing: 6) {
                 Picker("Focus Mode", selection: $engine.focusMode) {
                     ForEach(FocusControlMode.allCases) { mode in
-                        Text(mode.title).tag(mode)
+                        Text(mode.shortTitle).tag(mode)
                     }
                 }
                 .pickerStyle(.segmented)
@@ -4538,63 +4556,60 @@ struct FocusAndZoomDrawer: View {
                     }
                 }
                 .pickerStyle(.menu)
+
+                CompactTogglePill(title: "平滑AF", isOn: $engine.isSmoothAFEnabled, activeColor: .yellow)
             }
 
-            HStack(spacing: 8) {
-                Text(String(format: "MF 对焦环: %.2f", engine.lensPosition))
-                    .font(.system(size: 10, weight: .bold, design: .monospaced))
-                    .frame(width: 95, alignment: .leading)
-                Slider(
-                    value: Binding(
-                        get: { engine.lensPosition },
-                        set: { engine.setManualFocusLensPosition($0) }
-                    ),
-                    in: 0.0...1.0
-                )
-                .accentColor(.yellow)
-            }
+            CompactSliderRow(
+                title: "MF 对焦环",
+                value: Binding(
+                    get: { engine.lensPosition },
+                    set: { engine.setManualFocusLensPosition($0) }
+                ),
+                range: 0.0...1.0,
+                format: "%.2f"
+            )
 
-            HStack(spacing: 6) {
-                Button("设 A 点(\(String(format: "%.2f", engine.rackPointA)))") {
+            HStack(spacing: 5) {
+                Button("设A(\(String(format: "%.2f", engine.rackPointA)))") {
                     engine.rackPointA = engine.lensPosition
                 }
-                .font(.system(size: 10, weight: .bold, design: .monospaced))
-                .padding(.horizontal, 7).padding(.vertical, 4)
+                .font(.system(size: 9.5, weight: .bold, design: .monospaced))
+                .padding(.horizontal, 6).padding(.vertical, 4)
                 .background(Color.white.opacity(0.14)).cornerRadius(5)
 
-                Button("拉焦 → A") {
+                Button("拉焦→A") {
                     engine.triggerRackFocus(to: engine.rackPointA)
                 }
-                .font(.system(size: 10, weight: .bold, design: .monospaced))
-                .padding(.horizontal, 7).padding(.vertical, 4)
+                .font(.system(size: 9.5, weight: .bold, design: .monospaced))
+                .padding(.horizontal, 6).padding(.vertical, 4)
                 .background(Color.yellow.opacity(0.28)).foregroundColor(.yellow).cornerRadius(5)
 
-                Button("设 B 点(\(String(format: "%.2f", engine.rackPointB)))") {
+                Button("设B(\(String(format: "%.2f", engine.rackPointB)))") {
                     engine.rackPointB = engine.lensPosition
                 }
-                .font(.system(size: 10, weight: .bold, design: .monospaced))
-                .padding(.horizontal, 7).padding(.vertical, 4)
+                .font(.system(size: 9.5, weight: .bold, design: .monospaced))
+                .padding(.horizontal, 6).padding(.vertical, 4)
                 .background(Color.white.opacity(0.14)).cornerRadius(5)
 
-                Button("拉焦 → B") {
+                Button("拉焦→B") {
                     engine.triggerRackFocus(to: engine.rackPointB)
                 }
-                .font(.system(size: 10, weight: .bold, design: .monospaced))
-                .padding(.horizontal, 7).padding(.vertical, 4)
+                .font(.system(size: 9.5, weight: .bold, design: .monospaced))
+                .padding(.horizontal, 6).padding(.vertical, 4)
                 .background(Color.yellow.opacity(0.28)).foregroundColor(.yellow).cornerRadius(5)
 
-                Spacer()
+                Spacer(minLength: 2)
 
                 Text(String(format: "%.1fs", engine.rackDurationSeconds))
-                    .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                    .font(.system(size: 9.5, weight: .semibold, design: .monospaced))
                 Stepper("", value: $engine.rackDurationSeconds, in: 0.3...5.0, step: 0.2)
                     .labelsHidden()
+                    .scaleEffect(0.85)
             }
 
             HStack(spacing: 8) {
-                Toggle("Focus Peaking 峰值", isOn: $engine.focusPeakingEnabled)
-                    .font(.system(size: 10, weight: .semibold, design: .monospaced))
-                    .fixedSize()
+                CompactTogglePill(title: "峰值对焦 Peaking", isOn: $engine.focusPeakingEnabled, activeColor: .green)
                 Picker("Color", selection: $engine.focusPeakingColor) {
                     ForEach(FocusPeakingColorOption.allCases) { col in
                         Text(col.title).tag(col)
@@ -4612,14 +4627,10 @@ struct ExposureAndWBDrawer: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                Toggle("手动曝光 (快门角度 + ISO)", isOn: $engine.isManualExposure)
-                    .font(.system(size: 11, weight: .bold, design: .monospaced))
-                    .foregroundColor(.yellow)
-                Spacer()
-                Toggle("锁定色温 WB", isOn: $engine.isWhiteBalanceLocked)
-                    .font(.system(size: 11, weight: .bold, design: .monospaced))
-                    .foregroundColor(.cyan)
+            HStack(spacing: 10) {
+                CompactTogglePill(title: "手动曝光 (快门+ISO)", isOn: $engine.isManualExposure, activeColor: .yellow)
+                CompactTogglePill(title: "锁定白平衡 (K+Tint)", isOn: $engine.isWhiteBalanceLocked, activeColor: .cyan)
+                Spacer(minLength: 0)
             }
 
             if isLandscape {
@@ -4679,11 +4690,8 @@ struct LUTSystemDrawerView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            HStack {
-                Text("校准版 3D LUT 调色台 (支持永久驻留 .cube LUT)")
-                    .font(.system(size: 11, weight: .bold, design: .monospaced))
-                    .foregroundColor(.yellow)
-                Spacer()
+            // Action Row: Import Resident LUT + Bake Toggle + Reset (Fits cleanly inside 370pt!)
+            HStack(spacing: 6) {
                 Button {
                     showCubeImporter = true
                 } label: {
@@ -4698,12 +4706,24 @@ struct LUTSystemDrawerView: View {
                     .foregroundColor(.yellow)
                     .cornerRadius(6)
                 }
+                .fixedSize()
 
-                Button("重置参数") {
+                CompactTogglePill(title: "烧录LUT入视频", isOn: $engine.bakeIntoRecording, activeColor: .orange)
+
+                Spacer(minLength: 2)
+
+                Button {
                     engine.lutSettings.reset()
+                } label: {
+                    Text("重置参数")
+                        .font(.system(size: 10, weight: .bold, design: .monospaced))
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 4)
+                        .background(Color.red.opacity(0.22))
+                        .foregroundColor(.red)
+                        .cornerRadius(6)
                 }
-                .font(.system(size: 10, weight: .bold, design: .monospaced))
-                .foregroundColor(.red)
+                .fixedSize()
             }
 
             // Built-in LUT Presets
@@ -4725,12 +4745,12 @@ struct LUTSystemDrawerView: View {
                 }
             }
 
-            // Resident .cube LUT Library Row (Saved across app launches!)
+            // Resident .cube LUT Library Row
             if !engine.residentLUTs.isEmpty {
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 6) {
                         Text("📌 驻留库:")
-                            .font(.system(size: 9, weight: .bold, design: .monospaced))
+                            .font(.system(size: 9.5, weight: .bold, design: .monospaced))
                             .foregroundColor(.cyan)
 
                         ForEach(engine.residentLUTs) { item in
@@ -4769,20 +4789,19 @@ struct LUTSystemDrawerView: View {
                 .pickerStyle(.segmented)
             }
 
-            // 2-Column Grid in Landscape so all sliders fit comfortably without overflowing!
             if isLandscape {
-                HStack(alignment: .top, spacing: 14) {
+                HStack(alignment: .top, spacing: 12) {
                     VStack(spacing: 4) {
                         CompactSliderRow(title: "LUT 强度", value: $engine.lutSettings.lutIntensity, range: 0.0...1.0, format: "%.2f")
-                        CompactSliderRow(title: "曝光补偿 EV", value: $engine.lutSettings.exposureEV, range: -2.0...2.0, format: "%+.2f")
+                        CompactSliderRow(title: "曝光 EV", value: $engine.lutSettings.exposureEV, range: -2.0...2.0, format: "%+.2f")
                         CompactSliderRow(title: "对比度", value: $engine.lutSettings.contrast, range: 0.6...1.5, format: "%.2f")
                     }
                     VStack(spacing: 4) {
                         if engine.selectedSensorPreset == .openGateMax {
-                            CompactSliderRow(title: "OpenGate去断层", value: $engine.lutSettings.debanding, range: 0.0...1.0, format: "%.2f")
+                            CompactSliderRow(title: "去断层", value: $engine.lutSettings.debanding, range: 0.0...1.0, format: "%.2f")
                         }
-                        CompactSliderRow(title: "高光柔和 Roll", value: $engine.lutSettings.highlightRollOff, range: 0.0...1.0, format: "%.2f")
-                        CompactSliderRow(title: "饱和度 Sat", value: $engine.lutSettings.saturation, range: 0.0...1.8, format: "%.2f")
+                        CompactSliderRow(title: "高光柔和", value: $engine.lutSettings.highlightRollOff, range: 0.0...1.0, format: "%.2f")
+                        CompactSliderRow(title: "饱和度", value: $engine.lutSettings.saturation, range: 0.0...1.8, format: "%.2f")
                     }
                 }
             } else {
@@ -4797,12 +4816,6 @@ struct LUTSystemDrawerView: View {
                     CompactSliderRow(title: "饱和度 Sat", value: $engine.lutSettings.saturation, range: 0.0...1.8, format: "%.2f")
                 }
             }
-
-            HStack {
-                Toggle("将当前 LUT 调色烧录进录制视频 (默认关闭以录制纯净 Log)", isOn: $engine.bakeIntoRecording)
-                    .font(.system(size: 10, weight: .semibold, design: .monospaced))
-                    .foregroundColor(.orange)
-            }
         }
     }
 }
@@ -4813,22 +4826,6 @@ struct MonitorAndSlateDrawer: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                Text("专业监看辅助 & 存储空间防占满保护")
-                    .font(.system(size: 11, weight: .bold, design: .monospaced))
-                    .foregroundColor(.yellow)
-                Spacer()
-                Button("导出当前 33³ .cube") {
-                    onExportCube()
-                }
-                .font(.system(size: 10, weight: .bold, design: .monospaced))
-                .padding(.horizontal, 8)
-                .padding(.vertical, 4)
-                .background(Color.green.opacity(0.25))
-                .foregroundColor(.green)
-                .cornerRadius(6)
-            }
-
             Picker("Diagnostic", selection: $engine.monitorDiagnostic) {
                 ForEach(MonitorDiagnosticMode.allCases) { mode in
                     Text(mode.title).tag(mode)
@@ -4843,41 +4840,49 @@ struct MonitorAndSlateDrawer: View {
             }
             .pickerStyle(.segmented)
 
-            HStack(spacing: 12) {
+            HStack(spacing: 8) {
                 HStack(spacing: 4) {
-                    Text("卷号 Reel:")
+                    Text("卷号:")
                         .font(.system(size: 10, weight: .semibold, design: .monospaced))
                     TextField("A001", text: $engine.projectReelName)
                         .font(.system(size: 10, weight: .bold, design: .monospaced))
                         .textFieldStyle(.roundedBorder)
-                        .frame(width: 65)
+                        .frame(width: 56)
                 }
                 Stepper("镜号 T\(String(format: "%02d", engine.clipTakeNumber))", value: $engine.clipTakeNumber, in: 1...99)
                     .font(.system(size: 10, weight: .semibold, design: .monospaced))
+
+                Spacer(minLength: 2)
+
+                Button("导出 .cube") {
+                    onExportCube()
+                }
+                .font(.system(size: 9.5, weight: .bold, design: .monospaced))
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .background(Color.green.opacity(0.25))
+                .foregroundColor(.green)
+                .cornerRadius(6)
+                .fixedSize()
             }
 
             VStack(alignment: .leading, spacing: 6) {
-                HStack {
-                    Text(String(format: "显存/RAM: %.0fMB • 沙盒缓存: %.1fMB • 手机可用: %.1fGB",
-                                engine.memoryFootprintMB, engine.tempStorageUsedMB, engine.deviceFreeSpaceGB))
-                        .font(.system(size: 9.5, weight: .bold, design: .monospaced))
-                        .foregroundColor(.cyan)
-                    Spacer()
-                    Toggle("录制后存相册", isOn: $engine.autoSaveVideoToPhotos)
-                        .font(.system(size: 10, weight: .semibold, design: .monospaced))
-                        .fixedSize()
-                }
+                Text(String(format: "显存/RAM: %.0fMB • 沙盒缓存: %.1fMB • 可用空间: %.1fGB",
+                            engine.memoryFootprintMB, engine.tempStorageUsedMB, engine.deviceFreeSpaceGB))
+                    .font(.system(size: 9.5, weight: .bold, design: .monospaced))
+                    .foregroundColor(.cyan)
+                    .lineLimit(1)
 
-                HStack(spacing: 8) {
+                HStack(spacing: 6) {
                     Button {
                         engine.performDeepMemoryAndStoragePurge()
                     } label: {
                         HStack(spacing: 4) {
                             Image(systemName: "bolt.shield.fill")
-                            Text("深度释放内存与系统缓存")
+                            Text("深度释放内存与缓存")
                         }
                         .font(.system(size: 10, weight: .bold, design: .monospaced))
-                        .padding(.horizontal, 10)
+                        .padding(.horizontal, 9)
                         .padding(.vertical, 5)
                         .background(Color.orange.opacity(0.28))
                         .foregroundColor(.orange)
@@ -4890,25 +4895,25 @@ struct MonitorAndSlateDrawer: View {
                         } label: {
                             HStack(spacing: 4) {
                                 Image(systemName: "trash.fill")
-                                Text("删除本次测试视频(\(engine.sessionSavedAssetIDs.count))")
+                                Text("删测试视频(\(engine.sessionSavedAssetIDs.count))")
                             }
                             .font(.system(size: 10, weight: .bold, design: .monospaced))
-                            .padding(.horizontal, 10)
+                            .padding(.horizontal, 9)
                             .padding(.vertical, 5)
                             .background(Color.red.opacity(0.28))
                             .foregroundColor(.red)
                             .cornerRadius(6)
                         }
                     }
+                    Spacer(minLength: 0)
                 }
             }
 
-            HStack {
-                Toggle("九宫格构图线", isOn: $engine.showGridOverlay)
-                    .font(.system(size: 10, weight: .semibold, design: .monospaced))
-                Spacer()
-                Toggle("真实时间码 (TOD)", isOn: $engine.useTimeOfDayTimecode)
-                    .font(.system(size: 10, weight: .semibold, design: .monospaced))
+            HStack(spacing: 8) {
+                CompactTogglePill(title: "录制存相册", isOn: $engine.autoSaveVideoToPhotos, activeColor: .yellow)
+                CompactTogglePill(title: "九宫格线", isOn: $engine.showGridOverlay, activeColor: .green)
+                CompactTogglePill(title: "真实时间码", isOn: $engine.useTimeOfDayTimecode, activeColor: .cyan)
+                Spacer(minLength: 0)
             }
         }
         .onAppear {
@@ -5032,7 +5037,7 @@ struct PostProductionGradingSheetView: View {
     }
 }
 
-// MARK: - 12. Reusable UI Components
+// MARK: - 12. Reusable UI Components (Equal-Width Tabs, Capsule Toggles & Fitted Sliders)
 
 struct TelemetryPill: View {
     let label: String
@@ -5060,7 +5065,7 @@ struct TelemetryPill: View {
     }
 }
 
-struct DrawerTabButton: View {
+struct EqualWidthDrawerTabButton: View {
     let title: String
     let icon: String
     let isActive: Bool
@@ -5068,17 +5073,47 @@ struct DrawerTabButton: View {
 
     var body: some View {
         Button(action: action) {
-            HStack(spacing: 4) {
+            HStack(spacing: 3) {
                 Image(systemName: icon)
-                    .font(.system(size: 10, weight: .bold))
+                    .font(.system(size: 9.5, weight: .bold))
                 Text(title)
-                    .font(.system(size: 10, weight: .bold, design: .monospaced))
+                    .font(.system(size: 9.5, weight: .bold, design: .monospaced))
+                    .lineLimit(1)
             }
-            .padding(.horizontal, 8)
-            .padding(.vertical, 5)
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 6)
             .background(isActive ? Color.yellow : Color.white.opacity(0.12))
             .foregroundColor(isActive ? .black : .white)
             .cornerRadius(7)
+        }
+    }
+}
+
+struct CompactTogglePill: View {
+    let title: String
+    @Binding var isOn: Bool
+    let activeColor: Color
+
+    var body: some View {
+        Button {
+            isOn.toggle()
+        } label: {
+            HStack(spacing: 4) {
+                Image(systemName: isOn ? "checkmark.circle.fill" : "circle")
+                    .font(.system(size: 10, weight: .bold))
+                Text(title)
+                    .font(.system(size: 9.5, weight: .bold, design: .monospaced))
+                    .lineLimit(1)
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .background(isOn ? activeColor.opacity(0.24) : Color.white.opacity(0.08))
+            .foregroundColor(isOn ? activeColor : .gray)
+            .cornerRadius(6)
+            .overlay(
+                RoundedRectangle(cornerRadius: 6)
+                    .stroke(isOn ? activeColor.opacity(0.55) : Color.white.opacity(0.12), lineWidth: 1)
+            )
         }
         .fixedSize()
     }
@@ -5095,15 +5130,17 @@ struct CompactSliderRow: View {
             Text(title)
                 .font(.system(size: 9.5, weight: .semibold, design: .monospaced))
                 .foregroundColor(.gray)
-                .frame(width: 84, alignment: .leading)
+                .frame(width: 78, alignment: .leading)
                 .lineLimit(1)
             Slider(value: $value, in: range)
                 .accentColor(.yellow)
             Text(String(format: format, value))
                 .font(.system(size: 9.5, weight: .bold, design: .monospaced))
                 .foregroundColor(.white)
-                .frame(width: 42, alignment: .trailing)
+                .frame(width: 40, alignment: .trailing)
+                .lineLimit(1)
         }
+        .padding(.horizontal, 2)
     }
 }
 
